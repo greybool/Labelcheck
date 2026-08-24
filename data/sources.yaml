@@ -1,0 +1,63 @@
+# Корпус LabelCheck: источники текстов регламентов.
+# Единая точка правды о том, какой текст лежит в data/raw/ и откуда он взят.
+# Проверка целостности: python data/verify_corpus.py
+#
+# Официальные публикации ЕАЭС для 034/2013 и 040/2016 существуют только
+# в виде сканов без текстового слоя, поэтому корпус собран из консолидированных
+# редакций правовых баз (скачаны вручную 2026-08-24). Поле sha256 фиксирует
+# точную версию файла: при замене файла обнови size_bytes и sha256.
+
+documents:
+  - id: "ТР ТС 005/2011"
+    title: "О безопасности упаковки"
+    file: "raw/tr_ts_005_2011.pdf"
+    edition: "с изменениями на 06.09.2024"
+    text_source: "cntd"
+    official_page: "https://eec.eaeunion.org/comission/department/deptexreg/tr/bezopypakovki.php"
+    size_bytes: 1987370
+    sha256: "ef879ccd5aa0395ec203e270113d40d0a81818cc11d01fd02fcb6cb67466a0ad"
+
+  - id: "ТР ТС 021/2011"
+    title: "О безопасности пищевой продукции"
+    file: "raw/tr_ts_021_2011.pdf"
+    edition: "с изменениями на 22.04.2024"
+    text_source: "cntd"
+    official_page: "https://eec.eaeunion.org/comission/department/deptexreg/tr/PischevayaProd.php"
+    size_bytes: 4800284
+    sha256: "35a4cd1343ad3fa65441edb8c8d25c40519a651a6cf52ed10e02a393ee512ae2"
+
+  - id: "ТР ТС 022/2011"
+    title: "Пищевая продукция в части ее маркировки"
+    file: "raw/tr_ts_022_2011.pdf"
+    edition: "с изменениями на 22.04.2024"
+    text_source: "cntd"
+    official_page: "https://eec.eaeunion.org/comission/department/deptexreg/tr/PischevkaMarkirovka.php"
+    size_bytes: 396666
+    sha256: "9bc53c7f61f86c94b65a432719b45c70201b9c73d38842277fb05daa31a497d2"
+
+  - id: "ТР ТС 029/2012"
+    title: "Требования безопасности пищевых добавок, ароматизаторов и технологических вспомогательных средств"
+    file: "raw/tr_ts_029_2012.pdf"
+    edition: "с изменениями от 18.09.2014 и 29.08.2023 (действуют с 27.02.2024)"
+    text_source: "garant"
+    official_page: "https://eec.eaeunion.org/comission/department/deptexreg/tr/bezopPischDobavok.php"
+    size_bytes: 3048520
+    sha256: "80ac7fc19ca2318f06cb7b9edce66258f2059557be5eb2773259b5de9c35ccc1"
+
+  - id: "ТР ТС 034/2013"
+    title: "О безопасности мяса и мясной продукции"
+    file: "raw/tr_ts_034_2013.pdf"
+    edition: "с изменениями на 27.09.2023 (редакция, действующая с 10.07.2024)"
+    text_source: "cntd"
+    official_page: "https://eec.eaeunion.org/comission/department/deptexreg/tr/tr-ts-034.php"
+    size_bytes: 911972
+    sha256: "99e050da9ef2f631a5679827b9009d1c787a4aec0eabfb027c65371086a5acf6"
+
+  - id: "ТР ЕАЭС 040/2016"
+    title: "О безопасности рыбы и рыбной продукции"
+    file: "raw/tr_eaeu_040_2016.pdf"
+    edition: "с изменениями на 23.06.2023"
+    text_source: "cntd"
+    official_page: "https://eec.eaeunion.org/comission/department/deptexreg/tr/TR_EEU_040_2016.php"
+    size_bytes: 1864193
+    sha256: "408b5698d7b1749f75fa603170795c195ceee11a8d535bdbdade00528723ff97"
