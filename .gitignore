@@ -20,3 +20,5 @@ venv/
 
 # Logs
 *.log
+
+samples_private/
