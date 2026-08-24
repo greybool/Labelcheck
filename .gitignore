@@ -22,3 +22,5 @@ venv/
 *.log
 
 samples_private/
+
+HANDOFF.md
