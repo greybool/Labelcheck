@@ -23,7 +23,7 @@ venv/
 
 samples_private/
 
-HANDOFF.md
+handoffs/
 
 # Аудит парсера — не для репозитория
 data/dropped_lines.txt

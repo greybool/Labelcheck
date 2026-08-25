@@ -16,6 +16,7 @@
 - Конфиги (аспекты, модели, пороги) — в YAML/.env, не в код.
 - Скоуп: только то, что в ТЗ; идеи — в BACKLOG.md.
 - Напоминать о коммитах: список файлов ✅/❌, Summary (англ., imperative, ~50 симв.), Description 1–3 предложения (англ.).
+- Handoff-документы: только новые файлы в handoffs/handoff-NN.md, старые не перезаписывать.
 
 ## Стек
 Python 3.12, OpenAI API (CHEAP_MODEL + MAIN_MODEL из .env), text-embedding-3-small,
