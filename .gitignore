@@ -24,3 +24,6 @@ venv/
 samples_private/
 
 HANDOFF.md
+
+# Аудит парсера — не для репозитория
+data/dropped_lines.txt
