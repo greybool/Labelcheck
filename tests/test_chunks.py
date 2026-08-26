@@ -8,7 +8,9 @@
 """
 
 import json
+import re
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
@@ -82,6 +84,45 @@ def test_029_additive_function():
                and "консервант" in c["text"] for c in CHUNKS)
 
 
+def test_022_all_subsections():
+    """022 ст.4 — все 12 подразделов распознаны (регресс: 4.8/4.10/4.11
+    терялись из-за переноса длинного заголовка на вторую строку PDF)."""
+    nums = {(c.get("subsection") or "").split(" ")[0].rstrip(".")
+            for c in CHUNKS if c["regulation_id"] == "ТР ТС 022/2011"}
+    expected = {f"4.{i}" for i in range(1, 13)}
+    assert expected <= nums, f"нет подразделов: {sorted(expected - nums)}"
+
+
+def test_022_manufacturer_in_48():
+    """022 ч.4.8 п.1 — изготовитель (аспект 10) в правильном подразделе,
+    а не в 4.7 (регресс потерянного заголовка)."""
+    assert find(regulation_id="ТР ТС 022/2011", subsection_prefix="4.8", clause="1",
+                text_contains="аименование и место нахождения изготовителя")
+
+
+def test_022_gmo_in_411():
+    """022 ч.4.11 п.1 — сведения о ГМО (аспект 12) в правильном подразделе."""
+    assert find(regulation_id="ТР ТС 022/2011", subsection_prefix="4.11", clause="1",
+                text_contains="ГМО")
+
+
+def test_021_children_meat_clauses():
+    """021 ст.8 п.8/п.9 — перечни мясного сырья для детского питания слиты
+    в свои пункты (регресс: обрывок аннотации «115. - См...» рвал их
+    на псевдо-пункты с номером решения ЕЭК вместо номера пункта)."""
+    assert find(regulation_id="ТР ТС 021/2011", clause="8",
+                text_contains="свинина жилованная")
+    assert not find(regulation_id="ТР ТС 021/2011", clause="115")
+
+
+def test_no_annotation_scrap_chunks():
+    """Обрывки пометок Кодекса «NN. - См. предыдущую редакцию)» не становятся
+    пунктами ни в одном документе (регресс)."""
+    pat = re.compile(r"^\d+(?:\.\d+)*\.\s*-\s*См\. предыдущую редакцию")
+    bad = [c["chunk_id"] for c in CHUNKS if pat.match(c["text"])]
+    assert not bad, f"чанки-обрывки аннотаций: {bad[:5]}"
+
+
 # --- Структурные проверки ---
 
 def test_all_regulations_present():
@@ -99,6 +140,20 @@ def test_required_fields():
     for c in CHUNKS:
         assert c["text"].strip(), f"пустой текст: {c['chunk_id']}"
         assert c["regulation_id"] and c["chunk_id"] and c["edition"]
+
+
+def test_body_clause_address_unique():
+    """Адрес пункта в теле документа (регламент + раздел + подраздел + пункт)
+    уникален с точностью до part-разрезки длинного пункта. Это опора матчера
+    ground truth: попадание в пункт считается по этому адресу."""
+    groups = defaultdict(list)
+    for c in CHUNKS:
+        if c.get("clause") and not c.get("appendix"):
+            groups[(c["regulation_id"], c.get("section"),
+                    c.get("subsection"), c["clause"])].append(c)
+    bad = {k: [c["chunk_id"] for c in v] for k, v in groups.items()
+           if len(v) > 1 and not all(c.get("part") for c in v)}
+    assert not bad, f"неуникальные адреса пунктов: {list(bad.items())[:3]}"
 
 
 if __name__ == "__main__":

@@ -114,8 +114,16 @@ def flush(chunks: list, buf: list[str], meta: dict, cfg: dict) -> None:
         chunks.append({**meta, "part": part, "text": "\n".join(current)})
 
 
-def chunk_body(lines: list[str], structure: str, base: dict, cfg: dict) -> list[dict]:
-    """Тело документа: раздел → пункты. Пункт = чанк."""
+def chunk_body(lines: list[str], structure: str, base: dict, cfg: dict,
+               sub_prefix: str | None = None) -> list[dict]:
+    """Тело документа: раздел → пункты. Пункт = чанк.
+
+    sub_prefix — явный признак подраздела из cleanup.yaml → subsection_prefixes:
+    строка «<префикс>N. Текст с заглавной» — заголовок подраздела (в 022 это
+    «4.N.»); его перенос на следующие строки подклеивается к названию.
+    Для документов без префикса работает эвристика: короткий заголовок,
+    следующая строка начинает пункт.
+    """
     section_re = SECTION_PATTERNS[structure]
     # До первого заголовка раздела — преамбула (титул, оглавление): выбрасываем.
     start = next((i for i, ln in enumerate(lines) if section_re.match(ln)), 0)
@@ -128,31 +136,58 @@ def chunk_body(lines: list[str], structure: str, base: dict, cfg: dict) -> list[
         return {**base, "section": section, "subsection": subsection,
                 "clause": clause, "appendix": None, "is_table": False}
 
+    def starts_new_unit(ln: str) -> bool:
+        """Начинается ли с этой строки новый пункт/раздел/приложение."""
+        return bool(CLAUSE_RE.match(ln) or section_re.match(ln)
+                    or APPENDIX_RE.match(ln))
+
     body = lines[start:]
-    for i, ln in enumerate(body):
+    i = 0
+    while i < len(body):
+        ln = body[i]
         if section_re.match(ln):
             flush(chunks, buf, meta(), cfg)
             buf, section, subsection, clause = [], ln.strip(), None, None
+            i += 1
             continue
         m = CLAUSE_RE.match(ln)
         if m:
-            flush(chunks, buf, meta(), cfg)
             number, rest = m.group(1), m.group(2)
-            # Заголовок подраздела (например «4.1. Требования к …» в 022):
-            # многоуровневый номер, короткий текст с Заглавной буквы, без точки
-            # в конце, а следующая строка начинает пункт «1.» — иначе это обычный
-            # пункт вида 11.1 с переносом строки.
+            # Заголовок подраздела, способ 1 — явный префикс из конфига:
+            # номер ровно из двух уровней с нужным префиксом («4.8»), текст
+            # с Заглавной буквы. Работает и для заголовков, перенесённых
+            # в PDF на несколько строк.
+            explicit = bool(sub_prefix and number.startswith(sub_prefix)
+                            and number.count(".") == 1 and rest[:1].isupper())
+            # Способ 2 — эвристика для документов без префикса: многоуровневый
+            # номер, короткий текст с Заглавной, без пунктуации в конце,
+            # следующая строка начинает пункт (иначе это пункт вида 11.1
+            # с переносом строки).
             nxt = body[i + 1].strip() if i + 1 < len(body) else ""
-            looks_like_heading = ("." in number and rest[:1].isupper()
-                                  and len(rest) < cfg["min_chars"]
-                                  and not rest.endswith((".", ";", ":"))
-                                  and CLAUSE_RE.match(nxt))
-            if looks_like_heading:
-                subsection, clause, buf = f"{number}. {rest}".strip(), None, []
+            heuristic = (not sub_prefix and "." in number and rest[:1].isupper()
+                         and len(rest) < cfg["min_chars"]
+                         and not rest.endswith((".", ";", ":"))
+                         and CLAUSE_RE.match(nxt))
+            flush(chunks, buf, meta(), cfg)
+            if explicit or heuristic:
+                # Подклеиваем перенос заголовка к названию (максимум
+                # subsection_title_lines строк, дальше — начало пункта).
+                title = [f"{number}. {rest}".strip()]
+                j = i + 1
+                while (explicit and j < len(body)
+                       and j - i < cfg["subsection_title_lines"]
+                       and body[j].strip()
+                       and not starts_new_unit(body[j].strip())):
+                    title.append(body[j].strip())
+                    j += 1
+                subsection, clause, buf = " ".join(title), None, []
+                i = j if explicit else i + 1
             else:
                 clause, buf = number, [ln.strip()]
+                i += 1
             continue
         buf.append(ln.strip())
+        i += 1
     flush(chunks, buf, meta(), cfg)
     return chunks
 
@@ -218,7 +253,8 @@ def main() -> int:
 
         base = {"regulation_id": doc["id"], "regulation_name": doc["title"],
                 "edition": doc["edition"]}
-        doc_chunks = chunk_body(body, structure, base, cfg)
+        sub_prefix = config.get("subsection_prefixes", {}).get(stem)
+        doc_chunks = chunk_body(body, structure, base, cfg, sub_prefix)
         for num, app_lines in appendices:
             doc_chunks.extend(chunk_appendix(num, app_lines, base, cfg))
 
