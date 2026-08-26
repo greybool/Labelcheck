@@ -30,4 +30,5 @@ handoffs/
 # Аудит парсера — не для репозитория
 data/dropped_lines.txt
 
-!.env.example
+# Кэш эмбеддингов — пересоздаётся командой: python ingestion/index.py
+data/embeddings.npz

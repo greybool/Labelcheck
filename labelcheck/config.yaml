@@ -1,0 +1,26 @@
+# Конфигурация поиска LabelCheck. Поведение меняется здесь, не в коде.
+
+embedding:
+  model: text-embedding-3-small
+  dimensions: 1536
+  batch_size: 64                # чанков в одном API-вызове
+  cache: data/embeddings.npz    # кэш векторов с SHA256-пломбой корпуса (не в git)
+  # Шапка, добавляемая к тексту чанка перед эмбеддингом (контекст для парафраз).
+  # Явный список — какие метаданные попадают в вектор, а какие нет.
+  header_fields: [regulation_id, section, subsection, appendix]
+
+bm25:
+  stemmer: russian              # Snowball-стеммер; null — отключить (для сравнения)
+  # E511 латиницей → е511 кириллицей: в корпусе 2906 Е-кодов кириллицей
+  # и 169 латиницей, на упаковках встречаются оба алфавита.
+  normalize_latin_e: true
+
+qdrant:
+  mode: memory                  # memory — встроенный, векторы из npz-кэша;
+  url: http://localhost:6333    # server — по url (docker-compose, День 10)
+  collection: labelcheck
+
+search:
+  candidates: 20                # выдача каждого метода до слияния
+  top_k: 10                     # итоговая выдача после слияния
+  rrf_k: 60                     # константа RRF (стандарт из статьи Cormack et al., 2009)
