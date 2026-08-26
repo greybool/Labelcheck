@@ -10,6 +10,8 @@ venv/
 # Environment variables / secrets
 .env
 .env.*
+# ...но шаблон .env.example — публичная часть репозитория
+!.env.example
 
 # IDE
 .vscode/
@@ -27,3 +29,5 @@ handoffs/
 
 # Аудит парсера — не для репозитория
 data/dropped_lines.txt
+
+!.env.example
