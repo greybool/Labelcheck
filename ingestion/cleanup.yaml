@@ -56,6 +56,8 @@ structures:
   tr_ts_029_2012: articles_mixed    # Статья 1. Заголовок
   tr_ts_034_2013: roman_sections    # I. ЗАГОЛОВОК, сквозные пункты
   tr_eaeu_040_2016: roman_sections
+  tr_eaeu_051_2021: roman_sections  # мясо птицы (добавлен после Дня 6:
+                                    #   034 п.4в исключает птицу из 034)
 
 # Параметры нарезки.
 chunking:

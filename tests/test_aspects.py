@@ -63,7 +63,7 @@ def test_other_aspects_do_not_search():
         if a["group"] == "other":
             for field in ("regulations", "category_regulations", "basis", "queries"):
                 assert field not in a, (a["id"], field)
-            assert resolve_regulations(a, {"meat", "fish"}) == []
+            assert resolve_regulations(a, {"meat", "fish", "poultry"}) == []
 
 
 def test_regulatory_aspects_complete():
@@ -112,7 +112,7 @@ def test_basis_regs_covered_by_search_regs():
     """Регламент каждого основания входит в поисковый список аспекта
     (иначе вердикту не из чего цитировать это основание)."""
     for a in ASPECTS:
-        searchable = set(resolve_regulations(a, {"meat", "fish"}))
+        searchable = set(resolve_regulations(a, {"meat", "fish", "poultry"}))
         for basis in a.get("basis", []):
             assert basis["reg"] in searchable, (a["id"], basis["reg"])
 
@@ -168,6 +168,39 @@ def test_detect_both_categories():
 def test_detect_nothing_for_fruit():
     """Манго и овощи не поднимают категорийные регламенты."""
     assert DETECT("Манго замороженное кусочками, сахар") == {}
+
+
+def test_poultry_detected_for_chicken():
+    """Курица → poultry (051/2021; 034 п.4в исключает птицу из 034).
+    Generic-слово «мясо» при этом честно тянет и meat — дуальные слова
+    (мясо, фарш, печень) не различают вид животного; применимость 034
+    решает вердикт по пункту области применения, пользователь может
+    переопределить кнопками (--categories)."""
+    hits = DETECT("начинка: мясо курицы, лук, имбирь")
+    assert set(hits) == {"poultry", "meat"}, hits
+    assert "куриц" in hits["poultry"], hits
+    hits_en = DETECT("chicken dumplings")
+    assert set(hits_en) == {"poultry"}, hits_en
+    hits_pork = DETECT("свиной фарш, соль")
+    assert set(hits_pork) == {"meat"}, hits_pork
+
+
+def test_poultry_resolves_051():
+    aspect = BY_ID[1]
+    regs = resolve_regulations(aspect, {"poultry"})
+    assert regs == ["ТР ТС 022/2011", "ТР ЕАЭС 051/2021"], regs
+
+
+def test_category_scope_basis_resolves():
+    """Пункты области применения категорийных ТР существуют в корпусе
+    (нужны вердиктам для решения о применимости категории)."""
+    scope = DATA["category_scope_basis"]
+    assert set(scope) == {"meat", "fish", "poultry"}
+    for cat, entries in scope.items():
+        for basis in entries:
+            for clause in basis["clauses"]:
+                assert find_basis_chunks({**basis, "clauses": [clause]}, CHUNKS), \
+                    (cat, basis["reg"], clause)
 
 
 def test_resolve_regulations_layers():

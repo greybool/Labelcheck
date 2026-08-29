@@ -127,7 +127,26 @@ def test_no_annotation_scrap_chunks():
 
 def test_all_regulations_present():
     ids = {c["regulation_id"] for c in CHUNKS}
-    assert len(ids) == 6, f"регламентов в чанках: {len(ids)}, ожидалось 6"
+    assert len(ids) == 7, f"регламентов в чанках: {len(ids)}, ожидалось 7"
+
+
+def test_051_poultry_marking_present():
+    """051/2021 (мясо птицы, добавлен после Дня 6): раздел XII с маркировкой
+    на месте — п.115 требует вид и возрастную группу птицы у полуфабрикатов."""
+    hits = [c for c in CHUNKS
+            if c["regulation_id"] == "ТР ЕАЭС 051/2021"
+            and c.get("clause") == "115"
+            and "возрастной группе птицы" in c["text"]]
+    assert hits, "051 п.115 (вид и возрастная группа птицы) не найден"
+
+
+def test_051_scope_excludes_meat_dominant():
+    """051 I п.5в: исключение продукции, где мясная часть преобладает, —
+    пункт нужен вердиктам для решения о применимости."""
+    hits = [c for c in CHUNKS
+            if c["regulation_id"] == "ТР ЕАЭС 051/2021"
+            and c.get("clause") == "5" and "50 процентов" in c["text"]]
+    assert hits, "051 I п.5 с исключениями не найден"
 
 
 def test_chunk_sizes():
