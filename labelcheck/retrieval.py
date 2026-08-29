@@ -1,7 +1,9 @@
 """Поиск по корпусу регламентов: BM25, векторный (Qdrant), гибрид RRF.
 
 Три метода с одинаковым интерфейсом — каждый принимает текст запроса и
-возвращает список (chunk_id, score) от лучшего к худшему:
+возвращает список (chunk_id, score) от лучшего к худшему. Фильтр
+regulation принимает один регламент строкой или список (у аспектов
+чек-листа регламентов 1–4, см. labelcheck/aspects.yaml):
 
 - bm25_search:   точное совпадение слов (Е-коды, числа, термины);
 - vector_search: смысловая близость (парафразы: «калорийность» найдёт
@@ -73,6 +75,13 @@ class Tokenizer:
         return tokens
 
 
+def as_regulation_list(regulation: str | list[str] | None) -> list[str] | None:
+    """Нормализация фильтра: строка → список из одного элемента."""
+    if regulation is None:
+        return None
+    return [regulation] if isinstance(regulation, str) else list(regulation)
+
+
 def rrf_fuse(rankings: list[list[str]], rrf_k: int, top_k: int) -> list[tuple[str, float]]:
     """Reciprocal Rank Fusion: балл документа = сумма 1/(rrf_k + место)
     по всем выдачам, где он встретился. Скоры методов не используются —
@@ -109,14 +118,15 @@ class Retriever:
     # --- BM25 ---
 
     def bm25_search(self, query: str, k: int | None = None,
-                    regulation: str | None = None) -> list[tuple[str, float]]:
+                    regulation: str | list[str] | None = None) -> list[tuple[str, float]]:
         k = k or self.cfg["search"]["candidates"]
+        allowed = as_regulation_list(regulation)
         scores = self.bm25.get_scores(self.tokenizer(query))
         order = np.argsort(scores)[::-1]  # индексы от лучшего к худшему
         result = []
         for i in order:
             cid = self.chunk_ids[i]
-            if regulation and self.regulation_of[cid] != regulation:
+            if allowed is not None and self.regulation_of[cid] not in allowed:
                 continue
             if scores[i] <= 0:
                 break
@@ -172,13 +182,10 @@ class Retriever:
         return resp.data[0].embedding
 
     def vector_search(self, query: str, k: int | None = None,
-                      regulation: str | None = None) -> list[tuple[str, float]]:
+                      regulation: str | list[str] | None = None) -> list[tuple[str, float]]:
         k = k or self.cfg["search"]["candidates"]
         self._ensure_qdrant()
-        flt = None
-        if regulation:
-            flt = qm.Filter(must=[qm.FieldCondition(
-                key="regulation_id", match=qm.MatchValue(value=regulation))])
+        flt = self._regulation_filter(regulation)
         hits = self._qdrant.query_points(
             collection_name=self.cfg["qdrant"]["collection"],
             query=self.embed_query(query), limit=k, query_filter=flt).points
@@ -186,8 +193,21 @@ class Retriever:
 
     # --- Гибрид ---
 
+    @staticmethod
+    def _regulation_filter(regulation: str | list[str] | None):
+        """Payload-фильтр Qdrant: MatchValue для одного регламента,
+        MatchAny для списка (условие «regulation_id ∈ список»)."""
+        allowed = as_regulation_list(regulation)
+        if not allowed:
+            return None
+        if len(allowed) == 1:
+            match = qm.MatchValue(value=allowed[0])
+        else:
+            match = qm.MatchAny(any=allowed)
+        return qm.Filter(must=[qm.FieldCondition(key="regulation_id", match=match)])
+
     def hybrid_search(self, query: str, k: int | None = None,
-                      regulation: str | None = None) -> list[tuple[str, float]]:
+                      regulation: str | list[str] | None = None) -> list[tuple[str, float]]:
         k = k or self.cfg["search"]["top_k"]
         n = self.cfg["search"]["candidates"]
         bm25_ids = [cid for cid, _ in self.bm25_search(query, n, regulation)]
