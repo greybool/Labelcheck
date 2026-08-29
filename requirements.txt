@@ -8,3 +8,5 @@ qdrant-client==1.19.0
 openai==3.3.1
 python-dotenv==1.2.2
 numpy==2.4.4
+pypdfium2==5.7.1
+Pillow==12.2.0

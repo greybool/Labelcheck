@@ -32,3 +32,6 @@ data/dropped_lines.txt
 
 # Кэш эмбеддингов — пересоздаётся командой: python ingestion/index.py
 data/embeddings.npz
+
+# Vision-выводы макетов (полные тексты реальных этикеток) — не для репозитория
+data/layouts/
