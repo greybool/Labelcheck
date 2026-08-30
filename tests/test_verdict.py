@@ -408,6 +408,12 @@ def test_render_markdown_sections():
         assert needle in md, needle
 
 
+def test_manual_status_requires_next_action_rule():
+    """Промпт требует: «ручная проверка» завершается конкретным действием."""
+    for needle in ("конкретным следующим действием", "вопрос задать производителю"):
+        assert needle in V.SYSTEM_PROMPT, needle
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]
     failed = 0

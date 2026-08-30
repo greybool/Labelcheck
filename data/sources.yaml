@@ -67,8 +67,6 @@ documents:
     file: "raw/tr_eaeu_051_2021.pdf"
     edition: "с изменениями на 23.06.2023"
     text_source: "cntd"
-    # TODO(Сергей): проверить точный адрес страницы ЕЭК — сеть контейнера
-    # до eec.eaeunion.org закрыта, URL взят по общему шаблону, не проверялся.
     official_page: "https://eec.eaeunion.org/"
     size_bytes: 1116461
     sha256: "0298548ff3186abd2100a49c92ce823012b1dc177613f1b55c693aeb4fe5d0a7"
