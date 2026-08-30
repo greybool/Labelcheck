@@ -1,0 +1,43 @@
+{
+ "corpus_sha256": "1b7eb91424cacc596866552783710972b2bcf0e3b9ee77914420124e22006611",
+ "model": "gpt-5.4-mini-2026-03-17",
+ "prompt_sha256": "ac48199899b08096",
+ "seed": 20260830,
+ "quotas": {
+  "body_clause": 100,
+  "appendix_clause": 60,
+  "table_window": 60,
+  "no_clause": 20
+ },
+ "min_per_regulation": 8,
+ "generated_at": "2026-08-30",
+ "n_questions": 618,
+ "by_category": {
+  "body_clause": 259,
+  "no_clause": 48,
+  "appendix_clause": 157,
+  "table_window": 154
+ },
+ "by_style": {
+  "paraphrase": 198,
+  "verbatim": 420
+ },
+ "by_regulation": {
+  "ТР ТС 005/2011": 74,
+  "ТР ТС 021/2011": 124,
+  "ТР ТС 022/2011": 59,
+  "ТР ТС 029/2012": 98,
+  "ТР ТС 034/2013": 87,
+  "ТР ЕАЭС 040/2016": 78,
+  "ТР ЕАЭС 051/2021": 98
+ },
+ "chunks_used": 240,
+ "chunks_barren": 4,
+ "dropped_duplicates": 0,
+ "rejected_questions": 43,
+ "rejected_at_finalize": 65,
+ "tokens": {
+  "prompt": 170061,
+  "completion": 40716
+ }
+}

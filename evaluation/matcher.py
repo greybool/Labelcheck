@@ -28,6 +28,12 @@ from pathlib import Path
 # в таблице метрик (разбивка по категориям, не одно число).
 CATEGORIES = ("body_clause", "appendix_clause", "table_window", "no_clause")
 
+# Стили вопросов эталона (День 7): verbatim — терминологией фрагмента,
+# paraphrase — бытовым языком закупщика. Разбивка метрик по стилю показывает
+# эффект query rewriting: на verbatim он ≈ нулевой (вопрос уже «языком
+# регламента»), на paraphrase — виден.
+STYLES = ("verbatim", "paraphrase")
+
 
 def sha256_of(path: Path) -> str:
     """SHA256-хэш файла, читая кусками по 1 МБ (как в data/verify_corpus.py)."""
@@ -101,6 +107,22 @@ def rank_of(gold_id: str, retrieved_ids: list[str], index: dict):
     return None
 
 
+def rank_of_record(rec: dict, retrieved_ids: list[str], index: dict):
+    """Ранг попадания для записи эталона (расширение rank_of, День 7).
+
+    Попадание = совпадение match_key (для пунктов тела это адрес — любая
+    part-часть равнозначна) ИЛИ chunk_id из явного списка
+    rec["accepted_chunk_ids"]. Список заполняется при генерации эталона
+    детерминированно (part-части того же пункта приложения) — правило зачёта
+    остаётся явным полем схемы, без эвристик в eval-коде (ТЗ §5).
+    """
+    accepted = set(rec.get("accepted_chunk_ids") or [rec["chunk_id"]])
+    for pos, rid in enumerate(retrieved_ids, start=1):
+        if is_hit(rec["chunk_id"], rid, index) or rid in accepted:
+            return pos
+    return None
+
+
 def validate_record(rec: dict, index: dict) -> list[str]:
     """Проверка одной строки ground_truth.jsonl. Возвращает список проблем.
 
@@ -122,6 +144,18 @@ def validate_record(rec: dict, index: dict) -> list[str]:
     if rec["regulation_id"] != chunk["regulation_id"]:
         problems.append(f"regulation_id {rec['regulation_id']!r} не совпадает "
                         f"с регламентом чанка {chunk['regulation_id']!r}")
+    # Поля Дня 7 — необязательные для старых записей, но если есть, то валидные.
+    if "style" in rec and rec["style"] not in STYLES:
+        problems.append(f"неизвестный style {rec['style']!r}")
+    if "accepted_chunk_ids" in rec:
+        acc = rec["accepted_chunk_ids"]
+        if not isinstance(acc, list) or rec["chunk_id"] not in acc:
+            problems.append("accepted_chunk_ids обязан быть списком "
+                            "и содержать сам chunk_id")
+        else:
+            unknown = [cid for cid in acc if cid not in index]
+            if unknown:
+                problems.append(f"accepted_chunk_ids вне корпуса: {unknown!r}")
     return problems
 
 

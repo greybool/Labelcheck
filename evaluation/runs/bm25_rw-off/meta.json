@@ -1,0 +1,16 @@
+{
+ "run_id": "bm25_rw-off",
+ "method": "bm25",
+ "rewriting": "off",
+ "date": "2026-08-30",
+ "corpus_sha256": "1b7eb91424cacc596866552783710972b2bcf0e3b9ee77914420124e22006611",
+ "gt_sha256": "f948f2eca4b979417f0cf1149ce198272be510ace4594c55fedf6c2f442e2ca8",
+ "n_questions": 618,
+ "search": {
+  "candidates": 20,
+  "top_k": 10,
+  "rrf_k": 60
+ },
+ "embedding_model": "text-embedding-3-small",
+ "rewrite_n": 2
+}
