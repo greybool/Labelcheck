@@ -391,9 +391,9 @@ def test_check_layout_report_shape():
     assert len(report["verdicts"]) == 19
     assert [b["id"] for b in report["other_remarks"]] == [18, 19]
     assert set(report["meta"]["categories"]) == {"meat"}  # свинина в составе
-    # 18 LLM-аспектов (17-й без LLM): 12 по одному вызову + 6 нестабильных
-    # по 3 голоса (день надёжности) + 1 CHEAP (орфография) = 31
-    assert len(client.calls) == 31
+    # 18 LLM-аспектов (17-й без LLM): 11 по одному вызову + 7 нестабильных
+    # по 3 голоса (день надёжности; 20 добавлен днём 9) + 1 CHEAP = 33
+    assert len(client.calls) == 33
     assert report["vision"]["manual_regions"][0]["id"] == "r4"
 
 

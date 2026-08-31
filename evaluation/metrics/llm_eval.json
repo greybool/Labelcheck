@@ -6,25 +6,25 @@
     "supported": 0,
     "relevant_ok": 1,
     "relevant_judged": 1,
-    "invented": 0
+    "invented": 1
    },
    "2": {
     "n": 1,
-    "supported": 0,
-    "relevant_ok": 0,
+    "supported": 1,
+    "relevant_ok": 1,
     "relevant_judged": 1,
-    "invented": 1
+    "invented": 0
    },
    "3": {
     "n": 1,
     "supported": 1,
     "relevant_ok": 1,
     "relevant_judged": 1,
-    "invented": 1
+    "invented": 0
    },
    "4": {
     "n": 1,
-    "supported": 0,
+    "supported": 1,
     "relevant_ok": 1,
     "relevant_judged": 1,
     "invented": 0
@@ -45,31 +45,31 @@
    },
    "7": {
     "n": 1,
-    "supported": 0,
+    "supported": 1,
     "relevant_ok": 1,
     "relevant_judged": 1,
-    "invented": 1
+    "invented": 0
    },
    "8": {
     "n": 1,
-    "supported": 0,
+    "supported": 1,
     "relevant_ok": 1,
     "relevant_judged": 1,
     "invented": 0
    },
    "9": {
     "n": 1,
-    "supported": 0,
-    "relevant_ok": 0,
+    "supported": 1,
+    "relevant_ok": 1,
     "relevant_judged": 1,
-    "invented": 1
+    "invented": 0
    },
    "10": {
     "n": 1,
-    "supported": 0,
+    "supported": 1,
     "relevant_ok": 1,
     "relevant_judged": 1,
-    "invented": 1
+    "invented": 0
    },
    "11": {
     "n": 1,
@@ -80,8 +80,8 @@
    },
    "12": {
     "n": 1,
-    "supported": 0,
-    "relevant_ok": 0,
+    "supported": 1,
+    "relevant_ok": 1,
     "relevant_judged": 1,
     "invented": 0
    },
@@ -101,24 +101,24 @@
    },
    "15": {
     "n": 1,
-    "supported": 1,
+    "supported": 0,
     "relevant_ok": 1,
     "relevant_judged": 1,
     "invented": 0
    },
    "16": {
     "n": 1,
-    "supported": 1,
+    "supported": 0,
     "relevant_ok": 1,
     "relevant_judged": 1,
     "invented": 0
    },
    "20": {
     "n": 1,
-    "supported": 0,
-    "relevant_ok": 0,
+    "supported": 1,
+    "relevant_ok": 1,
     "relevant_judged": 1,
-    "invented": 1
+    "invented": 0
    },
    "21": {
     "n": 1,
@@ -130,9 +130,9 @@
   },
   "total": {
    "n": 18,
-   "supported": 8,
-   "invented": 6,
-   "relevant_ok": 14,
+   "supported": 14,
+   "invented": 1,
+   "relevant_ok": 18,
    "relevant_judged": 18
   },
   "runs": [
