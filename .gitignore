@@ -42,3 +42,9 @@ data/reports/
 # Кэши оценки Дня 7 — пересоздаваемые (evaluation/runs/ и metrics/ — в git)
 data/gt_embeddings.npz
 evaluation/ground_truth.partial.jsonl
+# Эталонная разметка vision-оценки — тексты реальных макетов, не в git
+data/vision_gt/
+
+# Прогоны vision новой схемы (приёмка) — тексты макетов, не в git
+data/layouts_v2/
+data/layouts_v3/

@@ -149,8 +149,13 @@ def run_overview(client, model, full_img, cfg, tally):
     kinds_text = "\n".join(f"- {k} — {KIND_HINTS[k]}" for k in cfg["kinds"]
                            if k != "technical")
     prompt = OVERVIEW_PROMPT % kinds_text
-    tiles = render.overview_tiles(full_img, cfg["overview_split_aspect"],
-                                  cfg["crop_overlap_pct"])
+    if "overview_max_downscale" in cfg:
+        tiles = render.overview_grid(
+            full_img, cfg["overview_long_side"], cfg["overview_max_downscale"],
+            cfg["crop_overlap_pct"], cfg.get("overview_tile_tolerance", 0.15))
+    else:  # старое правило «по вытянутости» — для конфигов без нового ключа
+        tiles = render.overview_tiles(full_img, cfg["overview_split_aspect"],
+                                      cfg["crop_overlap_pct"])
     regions = []
     for t_i, (tile_img, frame) in enumerate(tiles):
         overview_img = render.make_overview(tile_img, cfg["overview_long_side"])
@@ -249,11 +254,19 @@ def _words(text, min_len):
     в слое и в vision-тексте алфавит Е-кода может различаться, это не
     расхождение по существу.
     """
-    words = re.findall(r"[а-яёa-z0-9]+", text.lower())
+    words = re.findall(r"[а-яёa-z0-9가-힣]+", text.lower())
     # 'cid' — мусор текстового слоя: pdfplumber пишет «(cid:NNN)» для
-    # символов без юникод-маппинга, это не слова макета
-    return {re.sub(r"^e(\d)", r"е\1", w) for w in words
-            if len(w) >= min_len and w != "cid"}
+    # символов без юникод-маппинга, это не слова макета.
+    # Хангыль плотный (당면 = «стеклянная лапша» — 2 слога), поэтому
+    # корейские слова проходят с длины 2 — иначе сверка слепа к KR
+    # (потеря 대두단백/당면 в прогоне v3 прошла мимо сторожей).
+    def keep(w):
+        if w == "cid":
+            return False
+        if re.search(r"[가-힣]", w):
+            return len(w) >= 2
+        return len(w) >= min_len
+    return {re.sub(r"^e(\d)", r"е\1", w) for w in words if keep(w)}
 
 
 def text_layer_words(pdf_path, boxes_px, scale, min_len,
@@ -355,6 +368,177 @@ def missing_kinds(result_regions, cfg):
 
 # ── сборка ───────────────────────────────────────────────────────────────────
 
+def layer_word_boxes(pdf_path, page_index=0):
+    """Слова текстового слоя с рамками в долях страницы 0..1.
+
+    Для прищёлкивания рамок обзора и двустороннего сторожа. None — слоя нет
+    (макет в кривых). dedupe_chars — как в text_layer_words (обводка дублирует
+    буквы).
+    """
+    import pdfplumber
+    with pdfplumber.open(pdf_path) as pdf:
+        page = pdf.pages[page_index]
+        pw, ph = float(page.width), float(page.height)
+        words = page.dedupe_chars().extract_words()
+        page.flush_cache()
+        page.get_textmap.cache_clear()
+    out = [(w["text"], (w["x0"] / pw, w["top"] / ph,
+                        w["x1"] / pw, w["bottom"] / ph)) for w in words]
+    return out or None
+
+
+def snap_bbox_to_words(bbox, word_boxes, max_expand_pct):
+    """Расширяет рамку региона до ЦЕЛЫХ слов текстового слоя.
+
+    Рамки обзора гуляют и режут слова по краю (разметка Дня 8: «SEOUL» без
+    хвоста, склейки на краях). Слово, чей центр внутри рамки, должно попасть
+    в неё целиком. Рамка только расширяется (не сжимается — растровые зоны
+    слоя не имеют) и не дальше max_expand_pct страницы за сторону, чтобы
+    не утащить соседний блок.
+    """
+    x0, y0, x1, y1 = bbox
+    m = max_expand_pct / 100.0
+    nx0, ny0, nx1, ny1 = x0, y0, x1, y1
+    for _, (wx0, wy0, wx1, wy1) in word_boxes:
+        cx, cy = (wx0 + wx1) / 2, (wy0 + wy1) / 2
+        if x0 <= cx <= x1 and y0 <= cy <= y1:
+            nx0, ny0 = min(nx0, wx0), min(ny0, wy0)
+            nx1, ny1 = max(nx1, wx1), max(ny1, wy1)
+    return (max(x0 - m, max(0.0, nx0)), max(y0 - m, max(0.0, ny0)),
+            min(x1 + m, min(1.0, nx1)), min(y1 + m, min(1.0, ny1)))
+
+
+def ink_ratio(full_img, bbox):
+    """Доля «чернильных» пикселей в рамке (отклонение от фонового тона).
+
+    Сторож пустых рамок (разметка Дня 8: пустой жёлтый регион mandu получил
+    чужой текст со словом «Exporter» из повторного чтения расширенной рамки).
+    """
+    W, H = full_img.size
+    x0, y0, x1, y1 = bbox
+    box = (round(x0 * W), round(y0 * H), round(x1 * W), round(y1 * H))
+    if box[2] - box[0] < 4 or box[3] - box[1] < 4:
+        return 0.0
+    crop = full_img.crop(box).convert("L")
+    crop.thumbnail((256, 256))
+    hist = crop.histogram()
+    modal = max(range(256), key=lambda v: hist[v])
+    total = sum(hist)
+    ink = sum(n for v, n in enumerate(hist) if abs(v - modal) > 28)
+    return ink / total if total else 0.0
+
+
+_INVENT_WORD = re.compile(r"[а-яёa-z]{4,}|[가-힣]{2,}", re.IGNORECASE)
+# Строки-описания графики (модель пишет их по промпту) — не текст макета,
+# в слое их нет по определению; в сторож выдумок не идут.
+_SIGN_LINE = re.compile(r"^\s*(знак|штрихкод|пиктограмм|логотип|иконк|\[)",
+                        re.IGNORECASE)
+
+
+def invented_words(vision_text, page_words, min_len=4):
+    """Слова vision-текста, которых нет нигде в текстовом слое страницы.
+
+    Двусторонний сторож (разметка Дня 8: сфабрикованный KR-состав, «Exporter»,
+    «PENTHIOPIL»). Применять только к регионам, где слой есть: в растровых
+    зонах отсутствие слова в слое ничего не значит. Не участвуют: числа и
+    короткие слова (шум), строки-описания знаков («знак EAC» — их нет в слое
+    по определению), слова, найденные ПОДСТРОКОЙ в склейке слоя — разреженные
+    заголовки («П и щ е в а я») слой отдаёт побуквенно.
+    """
+    def norm(w):
+        return w.lower().replace("ё", "е")
+    known = set()
+    for text, _ in page_words:
+        for w in _INVENT_WORD.findall(text):
+            known.add(norm(w))
+    joined = norm("".join(t for t, _ in page_words))
+    checked = "\n".join(line for line in (vision_text or "").splitlines()
+                         if not _SIGN_LINE.match(line))
+    out = []
+    for w in _INVENT_WORD.findall(checked):
+        ok_len = len(w) >= (2 if re.search(r"[가-힣]", w) else min_len)
+        if ok_len and norm(w) not in known and norm(w) not in joined:
+            out.append(w)
+    return out
+
+
+def merge_regions(regions, gap):
+    """Склейка примыкающих рамок в крупные блоки (итог перепрогона v2).
+
+    На чётких тайлах обзор начал дробить большой текстовый блок на
+    «ленточки»-строки с дырами между ними (EN-состав mandu выпал в дыру).
+    Рамки, пересекающиеся или отстоящие меньше gap (доля страницы),
+    объединяются: крупный блок — проверенный режим чтения (кропы >2000px
+    режутся на части штатно). technical и битые рамки не трогаются.
+    """
+    def close(a, b):
+        return (a[0] - gap <= b[2] and b[0] - gap <= a[2]
+                and a[1] - gap <= b[3] and b[1] - gap <= a[3])
+    regs = [dict(r) for r in regions]
+    changed = True
+    while changed:
+        changed = False
+        out = []
+        for r in regs:
+            if not r.get("bbox_ok") or r.get("kind") == "technical":
+                out.append(r)
+                continue
+            hit = next((o for o in out
+                        if o.get("bbox_ok") and o.get("kind") != "technical"
+                        and close(r["bbox"], o["bbox"])), None)
+            if hit is None:
+                out.append(r)
+                continue
+            hb, rb = hit["bbox"], r["bbox"]
+            hit["bbox"] = (min(hb[0], rb[0]), min(hb[1], rb[1]),
+                           max(hb[2], rb[2]), max(hb[3], rb[3]))
+            hit["note"] = (hit.get("note") or "") + f" +{r['id']}"
+            changed = True
+        regs = out
+    return regs
+
+
+def layer_fill_regions(regions, page_words, gap=0.015, min_words=3):
+    """Регионы из текстового слоя для зон, которые обзор не покрыл.
+
+    Слой знает, где на странице текст, лучше любой модели: слова, чей центр
+    не попал ни в одну рамку, кластеризуются по близости и становятся
+    дополнительными регионами (kind=other_text — kind это только подсказка).
+    Гарантия полноты там, где слой есть; страховка от «дыр» обзора.
+    """
+    boxes = [r["bbox"] for r in regions
+             if r.get("bbox_ok") and r.get("kind") != "technical"]
+
+    def covered(cx, cy):
+        return any(b[0] <= cx <= b[2] and b[1] <= cy <= b[3] for b in boxes)
+    orphans = [wb for _, wb in page_words
+               if not covered((wb[0] + wb[2]) / 2, (wb[1] + wb[3]) / 2)]
+    clusters = []
+    for wb in sorted(orphans, key=lambda w: (w[1], w[0])):
+        cx, cy = (wb[0] + wb[2]) / 2, (wb[1] + wb[3]) / 2
+        hit = next((c for c in clusters
+                    if c["bbox"][0] - gap <= cx <= c["bbox"][2] + gap
+                    and c["bbox"][1] - gap <= cy <= c["bbox"][3] + gap), None)
+        if hit is None:
+            clusters.append({"bbox": list(wb), "n": 1})
+        else:
+            b = hit["bbox"]
+            hit["bbox"] = [min(b[0], wb[0]), min(b[1], wb[1]),
+                           max(b[2], wb[2]), max(b[3], wb[3])]
+            hit["n"] += 1
+    out = []
+    for i, c in enumerate(clusters, start=1):
+        if c["n"] < min_words:
+            continue  # одиночные препресс-метки — не регион
+        b = c["bbox"]
+        out.append({"id": f"L{i}", "kind": "other_text", "lang": "mixed",
+                    "note": "добавлен по текстовому слою (обзор зону не покрыл)",
+                    "bbox": (max(0.0, b[0] - 0.004), max(0.0, b[1] - 0.004),
+                             min(1.0, b[2] + 0.004), min(1.0, b[3] + 0.004)),
+                    "bbox_ok": True})
+    return out
+
+
 def analyze(pdf_path, cfg=None, out_path=None, quiet=False):
     """Полный vision-прогон макета: PDF → JSON макета."""
     load_dotenv()
@@ -371,6 +555,22 @@ def analyze(pdf_path, cfg=None, out_path=None, quiet=False):
     regions = run_overview(client, overview_model, full_img, cfg, tally)
     if not quiet:
         print(f"обзор: {len(regions)} регионов")
+
+    # Прищёлкивание рамок к словам текстового слоя: рамки обзора гуляют и
+    # режут слова по краю; слово с центром внутри рамки входит в неё целиком.
+    page_words = layer_word_boxes(pdf_path)
+    if page_words:
+        for region in regions:
+            if region.get("bbox_ok"):
+                region["bbox"] = snap_bbox_to_words(
+                    region["bbox"], page_words,
+                    cfg.get("snap_max_expand_pct", 5.0))
+    regions = merge_regions(regions, cfg.get("merge_gap_pct", 0.8) / 100.0)
+    if page_words:
+        extra = layer_fill_regions(regions, page_words)
+        if extra and not quiet:
+            print(f"добавлено по слою: {len(extra)} регионов")
+        regions += extra
 
     result_regions = []
     for region in regions:
@@ -397,6 +597,13 @@ def analyze(pdf_path, cfg=None, out_path=None, quiet=False):
             reason = "нечитаемые места"
         else:
             reason = ""
+        # Сторож чернил: непустой текст при пустой рамке = текст пришёл из
+        # соседней зоны (повторное чтение расширяет рамку) — не факт макета.
+        if text.strip() and ink_ratio(full_img, region["bbox"]) < \
+                cfg.get("min_ink_ratio", 0.004):
+            status = STATUS_MANUAL
+            reason = ("в рамке нет чернил — текст мог прийти из соседней "
+                      "зоны при повторном чтении")
         pad = cfg["pad_pct"] / 100.0
         inset = (pad * full_img.size[0], pad * full_img.size[1])
         layer = text_layer_words(pdf_path, boxes_px, scale,
@@ -406,9 +613,22 @@ def analyze(pdf_path, cfg=None, out_path=None, quiet=False):
             status = STATUS_MANUAL
             reason = (f"расхождение с текстовым слоем "
                       f"{mismatch:.0%}: {', '.join(missing_words[:8])}")
+        # Двусторонний сторож: слова vision, которых нет НИГДЕ в слое страницы
+        # (только для регионов, где слой есть) — кандидаты в выдумки.
+        fake = []
+        if page_words and layer is not None:
+            fake = invented_words(text, page_words)
+            share = len(fake) / max(1, len(text.split()))
+            if (len(fake) >= cfg.get("invented_min_words", 2)
+                    and share >= cfg.get("invented_share", 0.08)):
+                status = STATUS_MANUAL
+                reason = ((reason + "; ") if reason else "") + (
+                    "слова вне текстового слоя (возможная выдумка): "
+                    + ", ".join(fake[:8]))
         result_regions.append({**_public(region), "text": text, "status": status,
                                "status_reason": reason,
-                               "text_layer_mismatch": mismatch})
+                               "text_layer_mismatch": mismatch,
+                               "invented_words": fake[:12]})
         if not quiet:
             flag = "⚠" if status == STATUS_MANUAL else "✓"
             print(f"  {flag} {region['id']:4s} {region['kind']:14s} "

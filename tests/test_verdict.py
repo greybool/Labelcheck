@@ -414,6 +414,31 @@ def test_manual_status_requires_next_action_rule():
         assert needle in V.SYSTEM_PROMPT, needle
 
 
+def test_prompt_requires_self_sufficient_explanation():
+    """Промпт требует самодостаточности: опираешься на норму — процитируй
+    (урок судьи Дня 8: объяснения ссылались на непроцитированные basis-нормы)."""
+    for needle in ("опираешься на норму — процитируй",
+                   "Читатель отчёта видит только citations"):
+        assert needle in V.SYSTEM_PROMPT, needle
+
+
+def test_ean13_checksum_and_near_misses():
+    """Чек-сумма EAN-13: валидный код проходит, битый и 14-значный — ручная
+    (кейс прогона v3: штрихкод mango прочитан слитно с лишней цифрой)."""
+    assert V.ean13_checksum_ok("4607070255215")        # реальный код mango
+    assert V.ean13_checksum_ok("8805957025951")        # реальный код mandu
+    assert not V.ean13_checksum_ok("4607070255214")    # битая контрольная
+    layout = {"regions": [
+        {"id": "a", "kind": "marks", "text": "штрихкод: 4 607070 255215"},
+        {"id": "b", "kind": "marks", "text": "41607070255215"},
+        {"id": "c", "kind": "marks", "text": "8 805957 025952"}]}
+    items = V.barcode_check(layout)["items"]
+    joined = " || ".join(items)
+    assert "сходится" in joined                        # валидный найден
+    assert "НЕ сходится" in joined                     # битый пойман
+    assert "14 цифр" in joined                         # слитный пойман
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]
     failed = 0

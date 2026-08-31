@@ -91,6 +91,41 @@ def overview_tiles(full_img, max_aspect, overlap_pct):
     ]
 
 
+def overview_grid(full_img, long_side, max_downscale, overlap_pct,
+                  tolerance=0.15):
+    """Сетка тайлов обзора по фактору ужатия (итог разметки Дня 8).
+
+    Старое правило резало ленту только «по вытянутости» — mandu (аспект 1.45)
+    не резался и ужимался в обзоре в 4 раза, рамки уезжали. Новое правило:
+    сторона тайла не должна превышать long_side * max_downscale, т.е. обзор
+    никогда не теряет деталей сильнее, чем в max_downscale раз. tolerance
+    не создаёт лишний тайл ради небольшого перебора стороны (например +7%).
+
+    Возвращает список (изображение, рамка тайла 0..1 страницы) с перехлёстом
+    overlap_pct между соседями; дубли регионов на перехлёстах снимает
+    dedup_regions, координаты сводит tile_bbox_to_page — как и раньше.
+    """
+    import math
+    W, H = full_img.size
+    tile_max = long_side * max_downscale
+    nx = max(1, math.ceil(W / tile_max - tolerance))
+    ny = max(1, math.ceil(H / tile_max - tolerance))
+    if nx * ny == 1:
+        return [(full_img, (0.0, 0.0, 1.0, 1.0))]
+    ov = overlap_pct / 100.0
+    tiles = []
+    for iy in range(ny):
+        for ix in range(nx):
+            x0 = max(0.0, ix / nx - ov / (2 * nx))
+            x1 = min(1.0, (ix + 1) / nx + ov / (2 * nx))
+            y0 = max(0.0, iy / ny - ov / (2 * ny))
+            y1 = min(1.0, (iy + 1) / ny + ov / (2 * ny))
+            img = full_img.crop((round(x0 * W), round(y0 * H),
+                                 round(x1 * W), round(y1 * H)))
+            tiles.append((img, (x0, y0, x1, y1)))
+    return tiles
+
+
 def tile_bbox_to_page(bbox, tile_frame):
     """Рамка 0..1 внутри части обзора → рамка 0..1 всей страницы."""
     tx0, ty0, tx1, ty1 = tile_frame

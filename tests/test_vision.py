@@ -8,6 +8,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from labelcheck import render
+from labelcheck import vision as V
 from labelcheck.vision import (STATUS_MANUAL, STATUS_OK, UNREADABLE_MARK,
                                _words, check_against_text_layer)
 
@@ -245,6 +246,92 @@ def test_unreadable_mark_forces_manual():
     check("status_consts",
           STATUS_MANUAL == "требует ручной проверки" and STATUS_OK == "прочитано"
           and UNREADABLE_MARK == "[неразборчиво]")
+
+
+def test_overview_grid_by_downscale():
+    """Сетка обзора по фактору ужатия: лента режется 2x2, обычный макет — цел."""
+    from PIL import Image
+    big = Image.new("RGB", (390, 410))     # при long_side=100, max_down=2
+    tiles = render.overview_grid(big, 100, 2.0, 10)
+    assert len(tiles) == 4
+    xs = [f for _, f in tiles]
+    assert min(x[0] for x in xs) == 0.0 and max(x[2] for x in xs) == 1.0
+    assert min(x[1] for x in xs) == 0.0 and max(x[3] for x in xs) == 1.0
+    # перехлёст между соседними столбцами есть
+    left = sorted(set(round(f[0], 3) for _, f in tiles))
+    right = sorted(set(round(f[2], 3) for _, f in tiles))
+    assert right[0] > left[1], "нет перехлёста между тайлами"
+    small = Image.new("RGB", (150, 180))
+    assert len(render.overview_grid(small, 100, 2.0, 10)) == 1
+    near = Image.new("RGB", (210, 100))    # перебор 5% — tolerance не плодит тайл
+    assert len(render.overview_grid(near, 100, 2.0, 10)) == 1
+    PASSED.append("overview_grid")
+
+
+def test_snap_bbox_expands_to_words():
+    """Рамка расширяется до целых слов слоя, но не сжимается и не дальше лимита."""
+    words = [("Налейте", (0.10, 0.10, 0.30, 0.14)),   # центр внутри, торчит слева
+             ("сосед",   (0.60, 0.50, 0.70, 0.54))]   # центр вне рамки
+    got = V.snap_bbox_to_words((0.15, 0.09, 0.40, 0.20), words, 5.0)
+    assert abs(got[0] - 0.10) < 1e-9      # расширилась до начала слова
+    assert got[2] == 0.40 and got[3] == 0.20  # не сжалась
+    got2 = V.snap_bbox_to_words((0.18, 0.09, 0.40, 0.20), words, 5.0)
+    assert abs(got2[0] - 0.13) < 1e-9     # лимит 5%: 0.18-0.05, не до 0.10
+    PASSED.append("snap_bbox")
+
+
+def test_ink_ratio_blank_vs_text():
+    """Пустая рамка — около нуля, рамка с текстом — заметно больше."""
+    from PIL import Image, ImageDraw
+    img = Image.new("RGB", (400, 200), "#ffd24d")
+    d = ImageDraw.Draw(img)
+    d.rectangle((210, 40, 380, 160), fill="#222222")   # «текст» справа
+    assert V.ink_ratio(img, (0.0, 0.0, 0.5, 1.0)) < 0.004
+    assert V.ink_ratio(img, (0.5, 0.0, 1.0, 1.0)) > 0.1
+    PASSED.append("ink_ratio")
+
+
+def test_invented_words_detected():
+    """Слова vision вне слоя страницы ловятся; числа и короткие — нет."""
+    page = [("Importer", None), ("Импортёр", None), ("организация", None)]
+    page = [(t, (0, 0, 0, 0)) for t, _ in page]
+    fake = V.invented_words("Exporter / Импортёр организация 690033", page)
+    assert fake == ["Exporter"]
+    assert V.invented_words("Импортёр организация", page) == []
+    PASSED.append("invented_words")
+
+
+def test_merge_regions_glues_adjacent():
+    """Примыкающие рамки склеиваются в блок; далёкие и technical — нет."""
+    regs = [{"id": "a", "kind": "composition", "bbox": (0.1, 0.1, 0.3, 0.2), "bbox_ok": True},
+            {"id": "b", "kind": "usage", "bbox": (0.1, 0.205, 0.3, 0.3), "bbox_ok": True},
+            {"id": "c", "kind": "marks", "bbox": (0.7, 0.7, 0.8, 0.8), "bbox_ok": True},
+            {"id": "t", "kind": "technical", "bbox": (0.1, 0.21, 0.3, 0.29), "bbox_ok": True}]
+    out = V.merge_regions(regs, 0.008)
+    ids = [r["id"] for r in out]
+    assert "b" not in ids and "a" in ids and "c" in ids and "t" in ids
+    merged = next(r for r in out if r["id"] == "a")
+    assert merged["bbox"] == (0.1, 0.1, 0.3, 0.3)
+    PASSED.append("merge_regions")
+
+
+def test_layer_fill_covers_orphan_words():
+    """Слова слоя вне рамок собираются в новый регион; одиночки — нет."""
+    regions = [{"id": "a", "kind": "composition", "bbox": (0.0, 0.0, 0.5, 0.5), "bbox_ok": True}]
+    words = [("внутри", (0.1, 0.1, 0.2, 0.12))] +             [(f"с{i}", (0.6, 0.60 + i * 0.012, 0.7, 0.61 + i * 0.012)) for i in range(4)] +             [("одиночка", (0.9, 0.95, 0.95, 0.96))]
+    extra = V.layer_fill_regions(regions, words)
+    assert len(extra) == 1
+    b = extra[0]["bbox"]
+    assert 0.59 < b[0] < 0.61 and b[3] > 0.64
+    PASSED.append("layer_fill")
+
+
+def test_invented_ignores_sign_lines_and_spaced_headers():
+    """Описания знаков и разреженные заголовки — не «выдумки»."""
+    page = [(c, (0, 0, 0, 0)) for c in "П и щ е в а я".split()] +            [("Импортёр", (0, 0, 0, 0)), ("ценность", (0, 0, 0, 0))]
+    text = "Пищевая ценность\nзнак EAC с изображением\nИмпортёр Exporter"
+    assert V.invented_words(text, page) == ["Exporter"]
+    PASSED.append("invented_filters")
 
 
 if __name__ == "__main__":
