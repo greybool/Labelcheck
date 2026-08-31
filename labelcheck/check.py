@@ -30,6 +30,12 @@ def main(argv=None):
                          "маркерам; none — только горизонтальные; либо список "
                          "через запятую из poultry,meat,fish "
                          "(например --categories poultry)")
+    ap.add_argument("--no-cache", action="store_true",
+                    help="не использовать кэш ответов модели "
+                         "(data/verdict_cache.json). Замеры стабильности — "
+                         "ТОЛЬКО с этим флагом, иначе повторный прогон "
+                         "вернёт закэшированные ответы и стабильность будет "
+                         "фиктивные 100%%")
     args = ap.parse_args(argv)
 
     if args.categories == "auto":
@@ -58,7 +64,8 @@ def main(argv=None):
     print("Строю индексы и коллекцию векторов (в памяти, может занять минуты)…")
     retriever = Retriever(cfg, openai_client=client)
     report = check_layout(layout, retriever, client, cfg,
-                          categories_override=override)
+                          categories_override=override,
+                          use_cache=not args.no_cache)
 
     out_dir = Path(args.out_dir) if args.out_dir else ROOT / cfg["verdict"]["reports_dir"]
     out_dir.mkdir(parents=True, exist_ok=True)

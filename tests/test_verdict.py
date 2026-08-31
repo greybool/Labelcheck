@@ -391,8 +391,9 @@ def test_check_layout_report_shape():
     assert len(report["verdicts"]) == 19
     assert [b["id"] for b in report["other_remarks"]] == [18, 19]
     assert set(report["meta"]["categories"]) == {"meat"}  # свинина в составе
-    # 18 вызовов MAIN (17-й без LLM) + 1 CHEAP (орфография)
-    assert len(client.calls) == 19
+    # 18 LLM-аспектов (17-й без LLM): 12 по одному вызову + 6 нестабильных
+    # по 3 голоса (день надёжности) + 1 CHEAP (орфография) = 31
+    assert len(client.calls) == 31
     assert report["vision"]["manual_regions"][0]["id"] == "r4"
 
 
@@ -437,6 +438,144 @@ def test_ean13_checksum_and_near_misses():
     assert "сходится" in joined                        # валидный найден
     assert "НЕ сходится" in joined                     # битый пойман
     assert "14 цифр" in joined                         # слитный пойман
+
+
+# ── «день надёжности»: голосование, кэш, самодостаточность ──────────────────
+
+BY_ID = {a["id"]: a for a in DATA["aspects"]}
+VOTE_ASPECT = BY_ID[CFG["verdict"]["vote_aspect_ids"][0]]
+
+_NA = {"status": "соответствует", "applicable": False, "citations": [],
+       "explanation": "к продукту не применяется"}
+_MANUAL = {"status": V.STATUS_MANUAL, "applicable": True, "citations": [],
+           "explanation": "сомнение"}
+
+
+def test_voting_majority_wins():
+    """2 голоса из 3 «соответствует» побеждают одиночную ручную проверку;
+    статусы всех голосов — в поле votes."""
+    client = FakeClient([_NA, _MANUAL, _NA])
+    v = V.judge_aspect(VOTE_ASPECT, V.collect_facts(LAYOUT), set(), CHUNKS,
+                       no_search, client, CFG, V.TokenTally())
+    assert len(client.calls) == 3
+    assert v["status"] == "соответствует" and v["applicable"] is False
+    assert v["votes"] == ["соответствует", V.STATUS_MANUAL, "соответствует"]
+
+
+def test_voting_all_different_goes_manual():
+    """Все три валидированных статуса разные → «требует ручной проверки»."""
+    facts = V.collect_facts(LAYOUT)
+    facts_text = "\n".join(f["text"] for f in facts)
+    basis, _ = V.gather_context(VOTE_ASPECT, set(), CHUNKS, no_search, CFG,
+                                facts_text)
+    assert basis, "у аспекта нет basis-пунктов — тест не построить"
+    viol = {"status": "возможное нарушение", "applicable": True,
+            "citations": [{"chunk_id": basis[0]["chunk_id"],
+                           "quote": basis[0]["text"][:40]}],
+            "explanation": "найдено расхождение"}
+    client = FakeClient([viol, _NA, _MANUAL])
+    v = V.judge_aspect(VOTE_ASPECT, facts, set(), CHUNKS,
+                       no_search, client, CFG, V.TokenTally())
+    assert v["status"] == V.STATUS_MANUAL
+    assert "голосование" in (v["downgraded_reason"] or "")
+    assert len(set(v["votes"])) == 3, v["votes"]
+
+
+def test_voting_only_for_listed_aspects():
+    """Аспект вне vote_aspect_ids — один вызов, поля votes нет."""
+    aspect = BY_ID[1]
+    assert aspect["id"] not in CFG["verdict"]["vote_aspect_ids"]
+    client = FakeClient([_MANUAL])
+    v = V.judge_aspect(aspect, V.collect_facts(LAYOUT), set(), CHUNKS,
+                       no_search, client, CFG, V.TokenTally())
+    assert len(client.calls) == 1 and "votes" not in v
+
+
+def test_verdict_cache_roundtrip_and_vote_salt():
+    """Повторный прогон с кэшем не зовёт API и воспроизводит РАЗНЫЕ голоса —
+    salt разводит ключи (иначе кэш вернул бы один ответ на все три голоса
+    и голосование стало бы фикцией)."""
+    import copy, tempfile
+    from pathlib import Path as P
+    cfg = copy.deepcopy(CFG)
+    facts = V.collect_facts(LAYOUT)
+    with tempfile.TemporaryDirectory() as td:
+        cfg["verdict"]["cache"] = str(P(td) / "verdict_cache.json")
+        client1 = FakeClient([_NA, _MANUAL, _NA])
+        v1 = V.judge_aspect(VOTE_ASPECT, facts, set(), CHUNKS, no_search,
+                            client1, cfg, V.TokenTally(), use_cache=True)
+        assert len(client1.calls) == 3  # промах кэша — реальные вызовы
+        client2 = FakeClient([_MANUAL])  # другие ответы: не должны понадобиться
+        v2 = V.judge_aspect(VOTE_ASPECT, facts, set(), CHUNKS, no_search,
+                            client2, cfg, V.TokenTally(), use_cache=True)
+        assert client2.calls == []      # всё из кэша
+        assert v2["votes"] == v1["votes"]
+        assert set(v2["votes"]) == {"соответствует", V.STATUS_MANUAL}
+
+
+def test_cache_off_by_default_in_library():
+    """Без use_cache=True файл кэша не создаётся: тесты и замеры стабильности
+    не зависят от кэша (фиктивные 100% стабильности)."""
+    import copy, tempfile
+    from pathlib import Path as P
+    cfg = copy.deepcopy(CFG)
+    with tempfile.TemporaryDirectory() as td:
+        path = P(td) / "verdict_cache.json"
+        cfg["verdict"]["cache"] = str(path)
+        client = FakeClient([_MANUAL])
+        V.judge_aspect(VOTE_ASPECT, V.collect_facts(LAYOUT), set(), CHUNKS,
+                       no_search, client, cfg, V.TokenTally())
+        assert not path.exists()
+
+
+def test_cache_key_depends_on_model_prompt_salt():
+    """Правка модели, user-промпта или номера голоса меняет ключ кэша."""
+    k = V._verdict_cache_key
+    assert k("m", "u") != k("m", "u", "vote1")
+    assert k("m", "u1") != k("m", "u2")
+    assert k("m1", "u") != k("m2", "u")
+
+
+def test_self_sufficiency_unreferenced_clause_downgrades():
+    """Объяснение ссылается на пункт, которого нет среди процитированных, —
+    вердикт понижается до ручной проверки (урок судьи Дня 8)."""
+    v = V.validate_verdict(
+        {"status": "соответствует", "applicable": True,
+         "citations": [{"chunk_id": "c1", "quote": "в порядке убывания"}],
+         "explanation": "Согласно п.9.9 состав указан верно."}, ALLOWED)
+    assert v["status"] == V.STATUS_MANUAL
+    assert "9.9" in (v["downgraded_reason"] or "")
+
+
+def test_self_sufficiency_referenced_clause_kept():
+    """Номер пункта есть в адресе процитированного чанка — статус не трогаем."""
+    v = V.validate_verdict(
+        {"status": "возможное нарушение", "applicable": True,
+         "citations": [{"chunk_id": "c1", "quote": "в порядке убывания"}],
+         "explanation": "Нарушены требования ч.4.4 п.1: порядок не соблюдён."},
+        ALLOWED)
+    assert v["status"] == "возможное нарушение" and not v["downgraded_reason"]
+
+
+def test_self_sufficiency_plain_numbers_not_refs():
+    """Числа без префикса пункта («в 100 г», «около 6 минут») — не ссылки,
+    ложного понижения нет."""
+    v = V.validate_verdict(
+        {"status": "возможное нарушение", "applicable": True,
+         "citations": [{"chunk_id": "c1", "quote": "в порядке убывания"}],
+         "explanation": "В 100 г продукта 250 ккал, варить около 6 минут — "
+                        "порядок компонентов не соблюдён."}, ALLOWED)
+    assert v["status"] == "возможное нарушение" and not v["downgraded_reason"]
+
+
+def test_self_sufficiency_subnumber_not_credited():
+    """«14» не зачитывается за «4.14»: сравнение по целым числовым токенам."""
+    refs = V.unresolved_clause_refs(
+        "см. п.14", [{"chunk_id": "c1"}],
+        {"c1": {"chunk_id": "c1", "regulation_id": "ТР ТС 022/2011",
+                "subsection": "4.14. Раздел", "clause": None,
+                "text": "текст без номеров"}})
+    assert refs == ["14"], refs
 
 
 if __name__ == "__main__":

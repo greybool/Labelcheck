@@ -23,13 +23,25 @@
    vision не меряет высоту букв в мм, замер — в BACKLOG). Аспекты 18–19 —
    «прочие замечания»: штрихкод без LLM, орфография CHEAP-моделью.
 
+«День надёжности» (эта сессия):
+5. Голосование для нестабильных аспектов (verdict.vote_aspect_ids):
+   verdict.votes вызовов, большинство валидированных статусов побеждает;
+   все статусы разные → «требует ручной проверки».
+6. Кэш сырых ответов модели data/verdict_cache.json (НЕ в git): ключ от
+   модели + обоих промптов, правка промпта инвалидирует кэш сама.
+7. Валидатор самодостаточности КОДОМ: номер пункта в объяснении обязан
+   встречаться в адресе или тексте процитированного чанка, иначе
+   «соответствует»/«нарушение» понижается до ручной проверки.
+
 Все параметры — labelcheck/config.yaml → verdict.
 """
 
+import hashlib
 import json
 import os
 import re
 import time
+from collections import Counter
 
 from labelcheck.aspects import CategoryDetector, find_basis_chunks, load_aspects, resolve_regulations
 from labelcheck.retrieval import ROOT, load_config, rrf_fuse
@@ -128,6 +140,73 @@ def ecode_lookup_chunks(codes: list[str], chunks: list[dict],
         if len(found) >= limit:
             break
     return found
+
+
+# ── кэш ответов вердикт-модели («день надёжности») ───────────────────────────
+# В промпты попадают тексты реальных макетов, поэтому файл кэша НЕ в git
+# (config → verdict.cache, путь в .gitignore). Ключ включает модель и ОБА
+# промпта: правка SYSTEM_PROMPT или сборки user_prompt инвалидирует кэш сама,
+# без ручного сброса. salt различает повторные вызовы при голосовании — иначе
+# три вызова с одним промптом вернули бы один закэшированный ответ и
+# голосование стало бы фикцией. Замеры стабильности гонять ТОЛЬКО с
+# --no-cache: кэш даёт фиктивные 100%.
+
+
+def _verdict_cache_path(cfg: dict):
+    return ROOT / cfg["verdict"]["cache"]
+
+
+def _verdict_cache_key(model: str, user_prompt: str, salt: str = "") -> str:
+    raw = "\x1f".join([model, SYSTEM_PROMPT, user_prompt, salt])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _load_json_cache(path) -> dict:
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
+    return {}
+
+
+def _save_json_cache(path, cache: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cache, ensure_ascii=False, indent=1, sort_keys=True),
+                   encoding="utf-8")
+    tmp.replace(path)  # атомарная замена: не портим кэш при падении на записи
+
+
+def call_model(client, model: str, user_prompt: str, cfg: dict,
+               tally: TokenTally, use_cache: bool, salt: str = "",
+               aspect_key: str = "") -> dict:
+    """Один вызов вердикт-модели → сырой dict ответа; с кэшем сырых ответов.
+
+    Кэшируется только валидный JSON — битый ответ не должен залипнуть.
+    Попадание в кэш не тратит токены (в tally не пишется)."""
+    path = _verdict_cache_path(cfg)
+    key = _verdict_cache_key(model, user_prompt, salt)
+    if use_cache:
+        cached = _load_json_cache(path).get(key)
+        if cached is not None:
+            return cached["raw"]
+
+    resp = client.chat.completions.create(
+        model=model,
+        response_format={"type": "json_object"},
+        messages=[{"role": "system", "content": SYSTEM_PROMPT},
+                  {"role": "user", "content": user_prompt}])
+    tally.add(model, resp.usage)
+    try:
+        raw = json.loads(resp.choices[0].message.content)
+    except json.JSONDecodeError:
+        return {"status": STATUS_MANUAL,
+                "explanation": "модель вернула не-JSON — ответ отброшен"}
+
+    if use_cache:
+        cache = _load_json_cache(path)  # перечитать: файл мог пополниться
+        cache[key] = {"model": model, "aspect": aspect_key, "salt": salt,
+                      "raw": raw}
+        _save_json_cache(path, cache)
+    return raw
 
 
 # ── факты с макета ───────────────────────────────────────────────────────────
@@ -342,6 +421,34 @@ def build_user_prompt(aspect: dict, facts: list[dict], basis_chunks: list[dict],
             + "\n\n".join(norm_lines))
 
 
+# Ссылка на пункт/часть/статью/приложение в тексте объяснения: префикс
+# (п., пп., пункт…, ч., част…, ст., стать…, прил…) + номер. Голое число без
+# префикса («в 100 г», «около 6 минут») ссылкой НЕ считается — иначе ложные
+# понижения. Числа в перечислении после «и»/запятой («пп. 13 и 14» → только
+# 13) сознательно не ловим: пропущенная ссылка не понижает вердикт зря.
+_CLAUSE_REF = re.compile(
+    r"(?<![а-яёa-z0-9])(?:пп?|пункт[а-яё]*|ч|част[а-яё]*|ст|стать[а-яё]*|"
+    r"прил[а-яё]*)\.?\s*(\d+(?:\.\d+)*)", re.I)
+
+_NUM_TOKEN = re.compile(r"\d+(?:\.\d+)*")
+
+
+def unresolved_clause_refs(explanation: str, citations: list[dict],
+                           by_id: dict) -> list[str]:
+    """Номера пунктов из объяснения, которых нет ни в адресе, ни в тексте
+    ни одного ПРОЦИТИРОВАННОГО чанка («день надёжности», урок судьи Дня 8:
+    объяснения ссылались на нормы, которых читатель отчёта не видит).
+    Сравнение — по целым числовым токенам: «14» не зачтётся за «4.14»."""
+    refs = {m.group(1) for m in _CLAUSE_REF.finditer(explanation or "")}
+    if not refs:
+        return []
+    hay = " ".join(
+        chunk_address(by_id[c["chunk_id"]]) + " " + by_id[c["chunk_id"]]["text"]
+        for c in citations if c["chunk_id"] in by_id)
+    have = set(_NUM_TOKEN.findall(hay))
+    return sorted(refs - have)
+
+
 def validate_verdict(raw: dict, allowed_chunks: list[dict]) -> dict:
     """Валидация ответа модели КОДОМ. Возвращает вердикт с полями
     status/applicable/citations/explanation/downgraded_reason."""
@@ -380,6 +487,18 @@ def validate_verdict(raw: dict, allowed_chunks: list[dict]) -> dict:
                       "автоматически (ТЗ §4.3)" + ("; " + "; ".join(problems) if problems else ""))
         status = STATUS_MANUAL
 
+    # Самодостаточность объяснения («день надёжности»): упомянул номер
+    # пункта — он обязан быть среди процитированного, иначе читатель отчёта
+    # не может проверить вывод.
+    if status in (STATUS_COMPLIANT, STATUS_VIOLATION) and applicable:
+        missing_refs = unresolved_clause_refs(
+            raw.get("explanation") or "", citations, by_id)
+        if missing_refs:
+            downgraded = ("объяснение ссылается на пункты, которых нет среди "
+                          f"процитированных ({', '.join(missing_refs)}) — "
+                          "понижено автоматически (самодостаточность)")
+            status = STATUS_MANUAL
+
     return {"status": status, "applicable": applicable, "citations": citations,
             "explanation": (raw.get("explanation") or "").strip(),
             "downgraded_reason": downgraded,
@@ -388,9 +507,17 @@ def validate_verdict(raw: dict, allowed_chunks: list[dict]) -> dict:
 
 def judge_aspect(aspect: dict, facts: list[dict], categories: set[str],
                  chunks: list[dict], search_fn, client, cfg: dict,
-                 tally: TokenTally, scope_basis: list[dict] | None = None) -> dict:
+                 tally: TokenTally, scope_basis: list[dict] | None = None,
+                 use_cache: bool = False) -> dict:
     """Полный вердикт одного регламентного аспекта (facts — весь макет,
-    собирается один раз на прогон в check_layout)."""
+    собирается один раз на прогон в check_layout).
+
+    Голосование («день надёжности»): для аспектов из verdict.vote_aspect_ids
+    (исторически нестабильные по замеру Дня 8) — verdict.votes вызовов;
+    побеждает большинство ВАЛИДИРОВАННЫХ статусов, представитель — первый
+    вердикт победившего статуса, статусы всех голосов — в поле "votes".
+    Все статусы разные → «требует ручной проверки»: модель нестабильна на
+    этом аспекте, решает человек. Остальные аспекты — один вызов."""
     base = {"id": aspect["id"], "key": aspect["key"], "name": aspect["name"]}
 
     if aspect["key"] == "font_size":  # решение Сергея: всегда ручная проверка
@@ -414,20 +541,33 @@ def judge_aspect(aspect: dict, facts: list[dict], categories: set[str],
     user_prompt = build_user_prompt(aspect, facts, basis_chunks, extra_chunks,
                                     categories) + arithmetic_note(arith)
 
-    model = os.environ[cfg["verdict"]["model_env"]]
-    resp = client.chat.completions.create(
-        model=model,
-        response_format={"type": "json_object"},
-        messages=[{"role": "system", "content": SYSTEM_PROMPT},
-                  {"role": "user", "content": user_prompt}])
-    tally.add(model, resp.usage)
-    try:
-        raw = json.loads(resp.choices[0].message.content)
-    except json.JSONDecodeError:
-        raw = {"status": STATUS_MANUAL,
-               "explanation": "модель вернула не-JSON — ответ отброшен"}
+    vcfg = cfg["verdict"]
+    model = os.environ[vcfg["model_env"]]
+    n_votes = (max(1, int(vcfg.get("votes", 1)))
+               if aspect["id"] in set(vcfg.get("vote_aspect_ids", []))
+               else 1)
 
-    verdict = validate_verdict(raw, allowed)
+    votes = []
+    for i in range(n_votes):
+        raw = call_model(client, model, user_prompt, cfg, tally, use_cache,
+                         salt=f"vote{i}" if i else "", aspect_key=aspect["key"])
+        votes.append(validate_verdict(raw, allowed))
+
+    verdict = votes[0]
+    if n_votes > 1:
+        statuses = [v["status"] for v in votes]
+        top_status, top_n = Counter(statuses).most_common(1)[0]
+        if top_n > 1:  # есть большинство — его представитель идёт в отчёт
+            verdict = next(v for v in votes if v["status"] == top_status)
+        else:  # все статусы разные — модель нестабильна, решает человек
+            verdict = dict(votes[0])
+            verdict["status"] = STATUS_MANUAL
+            verdict["downgraded_reason"] = (
+                f"голосование: {n_votes} вызова дали {n_votes} разных статуса "
+                f"({', '.join(statuses)}) — модель нестабильна на этом "
+                "аспекте, нужен взгляд человека")
+        verdict = {**verdict, "votes": statuses}
+
     result = {**base, **verdict,
               "context": {"basis": len(basis_chunks), "retrieval": len(extra_chunks)}}
     if arith:
@@ -592,7 +732,8 @@ def detect_categories(layout: dict,
 
 def check_layout(layout: dict, retriever, client, cfg: dict | None = None,
                  aspects_data: dict | None = None, search_fn=None,
-                 categories_override: set[str] | None = None) -> dict:
+                 categories_override: set[str] | None = None,
+                 use_cache: bool = False) -> dict:
     """Все вердикты по макету → структура отчёта (сериализуемый dict).
 
     categories_override — решение Сергея («кнопки»): None = автодетект по
@@ -600,6 +741,10 @@ def check_layout(layout: dict, retriever, client, cfg: dict | None = None,
     заданные категории (в отчёте помечается source=manual).
     search_fn(query, regs) -> [(chunk_id, score)] — подменяется в тестах;
     по умолчанию — гибрид с query rewriting.
+    use_cache — кэш ответов модели (data/verdict_cache.json): в библиотеке
+    по умолчанию ВЫКЛЮЧЕН (тесты и замеры стабильности детерминированы без
+    оглядки на кэш); CLI check включает его по умолчанию, флаг --no-cache
+    выключает.
     """
     from labelcheck.rewrite import hybrid_search_rewritten  # локально: цикл импортов
 
@@ -631,7 +776,7 @@ def check_layout(layout: dict, retriever, client, cfg: dict | None = None,
         if aspect["group"] == "regulatory":
             verdicts.append(judge_aspect(aspect, facts, categories, chunks,
                                          search_fn, client, cfg, tally,
-                                         scope_basis))
+                                         scope_basis, use_cache=use_cache))
         elif aspect["key"] == "barcode":
             other.append(barcode_check(layout))
         elif aspect["key"] == "spelling":
@@ -712,6 +857,9 @@ def render_markdown(report: dict) -> str:
                           f"{a.get('dev_kj_pct', '—')}%.*"]
         for c in v["citations"]:
             lines += ["", f"> {c['quote']}", f"> — {c['address']}"]
+        if v.get("votes"):
+            lines += ["", f"*Голосование ({len(v['votes'])} вызова): "
+                          + ", ".join(v["votes"]) + ".*"]
         if v["downgraded_reason"]:
             lines += ["", f"*Понижено автоматически: {v['downgraded_reason']}*"]
 

@@ -39,6 +39,9 @@ data/layouts/
 # Отчёты проверки (тексты и вердикты реальных макетов) — не для репозитория
 data/reports/
 
+# Кэш ответов вердикт-модели (в промптах — тексты реальных макетов)
+data/verdict_cache.json
+
 # Кэши оценки Дня 7 — пересоздаваемые (evaluation/runs/ и metrics/ — в git)
 data/gt_embeddings.npz
 evaluation/ground_truth.partial.jsonl
