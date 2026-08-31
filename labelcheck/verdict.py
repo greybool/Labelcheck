@@ -114,6 +114,19 @@ def extract_e_codes(text: str) -> list[str]:
 
 # Аспекты, чей поисковый запрос дополняется фактами макета (Е-коды состава).
 DYNAMIC_E_CODE_ASPECTS = {"additives", "warning_labels"}
+# Аспекты, получающие вторым шагом окна ГИГИЕНИЧЕСКИХ нормативов 029
+# (прил.3–18: «добавка | пищевая продукция | максимальный уровень») —
+# только «Пищевые добавки»: для предупредительных надписей эти таблицы
+# не нужны и раздували бы контекст. (Пункт B, день 9.)
+HYGIENE_E_CODE_ASPECTS = {"additives"}
+
+
+def _ecode_pattern(code: str) -> re.Pattern:
+    """Регулярка токена Е-кода в тексте: оба алфавита, допустим пробел
+    («Е 621»); «е160» не матчит «е1600»."""
+    digits = code.lstrip("eе")
+    return re.compile(rf"(?<![0-9а-яёa-z])[eе]\s?{re.escape(digits)}(?![0-9])",
+                      re.I)
 
 
 def ecode_lookup_chunks(codes: list[str], chunks: list[dict],
@@ -128,8 +141,7 @@ def ecode_lookup_chunks(codes: list[str], chunks: list[dict],
     несколько классов, строка перечня показывает их все."""
     found, seen = [], set()
     for code in codes:
-        digits = code.lstrip("eе")
-        pat = re.compile(rf"(?<![0-9а-яёa-z])[eе]\s?{re.escape(digits)}(?![0-9])", re.I)
+        pat = _ecode_pattern(code)
         for chunk in chunks:
             if chunk["regulation_id"] != reg or str(chunk.get("appendix")) != appendix:
                 continue
@@ -138,6 +150,40 @@ def ecode_lookup_chunks(codes: list[str], chunks: list[dict],
                 found.append(chunk)
                 break  # первое окно с этим кодом; следующий код
         if len(found) >= limit:
+            break
+    return found
+
+
+def hygiene_lookup_chunks(codes: list[str], chunks: list[dict],
+                          cfg: dict) -> list[dict]:
+    """Окна ГИГИЕНИЧЕСКИХ приложений 029 (прил.3–18) с Е-кодами состава —
+    второй шаг lookup'а (пункт B, день 9): таблицы «добавка | пищевая
+    продукция | максимальный уровень» дают вердикту основание сказать
+    «разрешён для категории с пределом…» или что категории продукта в
+    перечне не видно. Приложения и потолки — config → verdict.ecode_lookup
+    (BACKLOG предполагал прил.19/26/12 — по корпусу это ароматизаторы,
+    ферменты и носители, Е-кодов там нет; нормативы — в прил.3–18)."""
+    el = cfg["verdict"]["ecode_lookup"]
+    reg = el["reg"]
+    apps = {str(a) for a in el["hygiene_appendices"]}
+    per_code, total = el["hygiene_per_code"], el["hygiene_total"]
+    found, seen = [], set()
+    for code in codes:
+        pat = _ecode_pattern(code)
+        n = 0
+        for chunk in chunks:
+            if chunk["regulation_id"] != reg:
+                continue
+            if str(chunk.get("appendix")) not in apps:
+                continue
+            if chunk["chunk_id"] in seen or not pat.search(chunk["text"]):
+                continue
+            seen.add(chunk["chunk_id"])
+            found.append(chunk)
+            n += 1
+            if n >= per_code or len(found) >= total:
+                break
+        if len(found) >= total:
             break
     return found
 
@@ -288,7 +334,13 @@ def gather_context(aspect: dict, categories: set[str], chunks: list[dict],
 
     basis_chunks, seen = [], set()
     for basis in basis_entries:
-        if "appendix" in basis or basis["reg"] not in active:
+        if basis["reg"] not in active:
+            continue
+        # Приложения в basis по умолчанию НЕ грузятся (их строки достаёт
+        # ретрив/lookup — прил.2 029 это сотни окон). Флаг always: true
+        # кладёт приложение в контекст целиком, как тело-пункты — для
+        # компактных перечней вроде прил.1 к 022 (пункт B, день 9).
+        if "appendix" in basis and not basis.get("always"):
             continue
         for chunk in find_basis_chunks(basis, chunks):
             if chunk["chunk_id"] not in seen:
@@ -308,7 +360,12 @@ def gather_context(aspect: dict, categories: set[str], chunks: list[dict],
     codes = extract_e_codes(facts_text) if facts_text else []
     lookup_chunks = []
     if aspect["key"] in DYNAMIC_E_CODE_ASPECTS and codes:
-        for chunk in ecode_lookup_chunks(codes, chunks):
+        el = vcfg["ecode_lookup"]
+        pool = ecode_lookup_chunks(codes, chunks, reg=el["reg"],
+                                   limit=el["appendix_2_limit"])
+        if aspect["key"] in HYGIENE_E_CODE_ASPECTS:
+            pool += hygiene_lookup_chunks(codes, chunks, cfg)
+        for chunk in pool:
             if chunk["chunk_id"] in seen or len(chunk["text"]) > remaining:
                 continue
             seen.add(chunk["chunk_id"])

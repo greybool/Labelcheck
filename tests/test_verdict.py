@@ -654,6 +654,60 @@ def test_language_note_enters_prompt_for_language_aspect():
     assert "СВОДКА ЯЗЫКОВ" not in client2.calls[0]["messages"][1]["content"]
 
 
+# ── пункт B (день 9): прил.1 к 022 и гигиенический lookup 029 ───────────────
+
+def test_appendix_basis_loaded_only_with_always_flag():
+    """Прил.1 к 022 (always: true) попадает в basis аспекта 2 целиком;
+    приложения без флага (прил.2-4 к 022 у аспекта 6) — по-прежнему нет."""
+    basis, _ = V.gather_context(BY_KEY["composition"], set(), CHUNKS,
+                                no_search, CFG)
+    ap1 = [c for c in basis if c["regulation_id"] == "ТР ТС 022/2011"
+           and str(c.get("appendix")) == "1"]
+    assert len(ap1) == 2, [c["chunk_id"] for c in ap1]
+    assert "ВИДЫ КОМПОНЕНТОВ" in ap1[0]["text"]
+    basis6, _ = V.gather_context(BY_KEY["nutrition"], set(), CHUNKS,
+                                 no_search, CFG)
+    assert not [c for c in basis6 if c.get("appendix")], \
+        [c["chunk_id"] for c in basis6 if c.get("appendix")]
+
+
+def test_hygiene_lookup_finds_norm_windows():
+    """Е621 (глутамат) находит окно гигиенических нормативов усилителей
+    вкуса (прил.16); все окна — из настроенных приложений 029."""
+    rows = V.hygiene_lookup_chunks(["е621"], CHUNKS, CFG)
+    assert rows, "гигиенический lookup ничего не нашёл"
+    apps = {str(c.get("appendix")) for c in rows}
+    allowed = {str(a) for a in CFG["verdict"]["ecode_lookup"]["hygiene_appendices"]}
+    assert apps <= allowed, apps
+    assert "16" in apps, apps  # усилители вкуса и аромата
+
+
+def test_hygiene_lookup_respects_caps():
+    """Потолки конфига: не больше hygiene_per_code окон на код и
+    hygiene_total суммарно."""
+    el = CFG["verdict"]["ecode_lookup"]
+    rows1 = V.hygiene_lookup_chunks(["е322"], CHUNKS, CFG)  # частый код
+    assert len(rows1) <= el["hygiene_per_code"], [c["chunk_id"] for c in rows1]
+    many = ["е322", "е330", "е621", "е635", "е160a", "е471", "е202"]
+    rows = V.hygiene_lookup_chunks(many, CHUNKS, CFG)
+    assert len(rows) <= el["hygiene_total"]
+
+
+def test_hygiene_rows_enter_additives_context_only():
+    """Окна нормативов попадают в контекст аспекта 4, но не аспекта 20
+    (предупредительные надписи — не раздувать контекст)."""
+    _, extra4 = V.gather_context(BY_KEY["additives"], set(), CHUNKS,
+                                 no_search, CFG, facts_text="усилитель Е621")
+    hyg4 = [c for c in extra4 if str(c.get("appendix")) not in ("2", "None")
+            and c["regulation_id"] == "ТР ТС 029/2012"]
+    assert hyg4, [c["chunk_id"] for c in extra4]
+    _, extra20 = V.gather_context(BY_KEY["warning_labels"], set(), CHUNKS,
+                                  no_search, CFG, facts_text="усилитель Е621")
+    hyg20 = [c for c in extra20 if str(c.get("appendix")) not in ("2", "None")
+             and c["regulation_id"] == "ТР ТС 029/2012"]
+    assert not hyg20, [c["chunk_id"] for c in hyg20]
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]
     failed = 0
