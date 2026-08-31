@@ -578,6 +578,82 @@ def test_self_sufficiency_subnumber_not_credited():
     assert refs == ["14"], refs
 
 
+def test_unit_numbers_unsupported_downgrade():
+    """Число с °С в объяснении, которого нет ни в цитатах, ни в фактах, —
+    понижение (кейс дня 9: «минус 12°С» из ниоткуда в аспекте 9)."""
+    v = V.validate_verdict(
+        {"status": "соответствует", "applicable": True,
+         "citations": [{"chunk_id": "c1", "quote": "в порядке убывания"}],
+         "explanation": "Хранение не выше минус 12°С соблюдено."},
+        ALLOWED, facts_text="Хранить при температуре -18С... точнее -18 °С")
+    assert v["status"] == V.STATUS_MANUAL
+    assert "12" in (v["downgraded_reason"] or "")
+
+
+def test_unit_numbers_from_facts_kept():
+    """Число с °С есть в фактах макета — не понижаем."""
+    v = V.validate_verdict(
+        {"status": "возможное нарушение", "applicable": True,
+         "citations": [{"chunk_id": "c1", "quote": "в порядке убывания"}],
+         "explanation": "Указано хранение при минус 18°С, но условия неполны."},
+        ALLOWED, facts_text="Хранить при температуре -18 °С")
+    assert v["status"] == "возможное нарушение" and not v["downgraded_reason"]
+
+
+def test_unit_numbers_in_citation_kept():
+    """Число с % есть в тексте процитированного пункта — не понижаем;
+    запятая-разделитель приравнивается к точке («1,5%» = «1.5%»)."""
+    allowed = [{"chunk_id": "c9", "regulation_id": "ТР ТС 022/2011",
+                "subsection": "4.4. Общие требования", "clause": "9",
+                "text": "Доля компонента менее 1,5 процента (1,5%) может "
+                        "не указываться в порядке убывания."}]
+    v = V.validate_verdict(
+        {"status": "соответствует", "applicable": True,
+         "citations": [{"chunk_id": "c9", "quote": "может не указываться"}],
+         "explanation": "Порог 1.5% не превышен."}, allowed)
+    assert v["status"] == "соответствует" and not v["downgraded_reason"], v
+
+
+def test_kbju_deviation_numbers_no_false_positive():
+    """Проценты отклонений КБЖУ легитимны: judge_aspect передаёт валидатору
+    факты + арифметическую сверку, посчитанную кодом."""
+    arith = V.nutrition_arithmetic(
+        "Энергетическая ценность 470 кДж / 111 ккал\n"
+        "Жиры 1.6 г\nУглеводы 15 г\nБелки 8.2 г")
+    note = V.arithmetic_note(arith)
+    dev = str(arith["dev_kcal_pct"])
+    v = V.validate_verdict(
+        {"status": "возможное нарушение", "applicable": True,
+         "citations": [{"chunk_id": "c1", "quote": "в порядке убывания"}],
+         "explanation": f"Отклонение {dev}% превышает допуск."},
+        ALLOWED, facts_text="факты" + note)
+    assert v["status"] == "возможное нарушение" and not v["downgraded_reason"]
+
+
+def test_language_note_summary():
+    """Сводка языков для аспекта 16 считается кодом: языки регионов и типы
+    блоков без русского текста."""
+    note = V.language_note(V.collect_facts(LAYOUT))
+    assert "СВОДКА ЯЗЫКОВ" in note
+    assert "ru: 3" in note          # r1, r2, r4 — русские регионы LAYOUT
+    assert "marks" in note.split("БЕЗ русского")[1]  # r3 (none) — без русского
+
+
+def test_language_note_enters_prompt_for_language_aspect():
+    """Аспект 16 получает сводку языков в промпт (день 9: аспект качался,
+    модель каждый раз заново собирала картину языков)."""
+    client = FakeClient([_NA])
+    V.judge_aspect(BY_KEY["language"], V.collect_facts(LAYOUT), set(), CHUNKS,
+                   no_search, client, CFG, V.TokenTally())
+    user = client.calls[0]["messages"][1]["content"]
+    assert "СВОДКА ЯЗЫКОВ" in user
+    # другим аспектам сводка не подмешивается
+    client2 = FakeClient([_NA])
+    V.judge_aspect(BY_ID[1], V.collect_facts(LAYOUT), set(), CHUNKS,
+                   no_search, client2, CFG, V.TokenTally())
+    assert "СВОДКА ЯЗЫКОВ" not in client2.calls[0]["messages"][1]["content"]
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]
     failed = 0

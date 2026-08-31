@@ -31,7 +31,11 @@ from dotenv import load_dotenv
 
 from labelcheck.retrieval import CHUNKS_PATH, load_config
 
-MAX_CHUNK_CHARS = 1500   # текст процитированного пункта в промпте судьи
+MAX_CHUNK_CHARS = 3500   # текст процитированного пункта в промпте судьи:
+                         # полный чанк (max_chars нарезки = 3500). День 9:
+                         # лимит 1500 обрезал процитированную норму (цитата
+                         # аспекта 20 начиналась с позиции 1313) — судья
+                         # записывал «выдуманный пункт» на ровном месте
 MAX_FACTS_CHARS = 12000  # факты макета в промпте судьи (хвост режется)
 
 
@@ -69,10 +73,12 @@ def basis_context_texts(aspect: dict, categories: set[str], chunks: list[dict],
     return [f"--- {c['chunk_id']} ---\n{c['text']}" for c in basis + extra]
 
 
-def judge_verdict(client, model: str, prompt: str, verdict: dict,
-                  facts: str, chunk_texts: dict[str, str],
-                  basis_texts: list[str] | None = None) -> dict:
-    """Один вердикт → ответ судьи (3 попытки на сетевые сбои и битый JSON)."""
+def build_judge_user(verdict: dict, facts: str, chunk_texts: dict[str, str],
+                     basis_texts: list[str] | None = None,
+                     check_text: str = "") -> str:
+    """Пользовательский промпт судьи. check_text — доменные правила проверки
+    аспекта из aspects.yaml (день 9, решение Сергея): без них судья наказывал
+    вердикты за следование нашим же правилам (даты-шаблоны DD/MM/YYYY)."""
     cited = []
     for c in verdict.get("citations", []):
         text = chunk_texts.get(c["chunk_id"], "")[:MAX_CHUNK_CHARS]
@@ -85,13 +91,25 @@ def judge_verdict(client, model: str, prompt: str, verdict: dict,
         "цитаты": [{"chunk_id": c["chunk_id"], "quote": c["quote"]}
                    for c in verdict.get("citations", [])],
     }
-    user = (f"ФАКТЫ МАКЕТА:\n{facts}\n\n"
-            f"ВЕРДИКТ СИСТЕМЫ:\n{json.dumps(payload, ensure_ascii=False, indent=1)}\n\n"
-            f"ТЕКСТЫ ПРОЦИТИРОВАННЫХ ПУНКТОВ:\n" +
-            ("\n".join(cited) if cited else "(цитат нет)"))
+    user = f"ФАКТЫ МАКЕТА:\n{facts}\n\n"
+    if check_text.strip():
+        user += ("ПРАВИЛА ПРОВЕРКИ АСПЕКТА (заданы владельцем системы, "
+                 "часть постановки задачи):\n" + check_text.strip() + "\n\n")
+    user += (f"ВЕРДИКТ СИСТЕМЫ:\n{json.dumps(payload, ensure_ascii=False, indent=1)}\n\n"
+             f"ТЕКСТЫ ПРОЦИТИРОВАННЫХ ПУНКТОВ:\n" +
+             ("\n".join(cited) if cited else "(цитат нет)"))
     if basis_texts is not None:
         user += ("\n\nПОЛНЫЙ НАБОР НОРМ, КОТОРЫЙ ВИДЕЛА СИСТЕМА:\n"
                  + "\n".join(basis_texts))
+    return user
+
+
+def judge_verdict(client, model: str, prompt: str, verdict: dict,
+                  facts: str, chunk_texts: dict[str, str],
+                  basis_texts: list[str] | None = None,
+                  check_text: str = "") -> dict:
+    """Один вердикт → ответ судьи (3 попытки на сетевые сбои и битый JSON)."""
+    user = build_judge_user(verdict, facts, chunk_texts, basis_texts, check_text)
     last = None
     for attempt in range(3):
         try:
@@ -195,8 +213,9 @@ def main() -> int:
                     by_id[v["id"]], categories,
                     _CHUNKS_CACHE.setdefault("chunks", _load_chunks()),
                     cfg, facts, aspects_data)
-            judged[str(v["id"])] = judge_verdict(client, model, prompt, v,
-                                                 facts, chunk_texts, basis_texts)
+            judged[str(v["id"])] = judge_verdict(
+                client, model, prompt, v, facts, chunk_texts, basis_texts,
+                check_text=by_id[v["id"]].get("check", ""))
             tokens += judged[str(v["id"])]["tokens"]
             print(f"\r{rpath}: аспектов оценено {len(judged)}", end="", flush=True)
         print()

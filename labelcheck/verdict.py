@@ -396,6 +396,26 @@ def arithmetic_note(arith: dict | None) -> str:
             "спирт и полиолы не учтены): " + "; ".join(parts))
 
 
+def language_note(facts: list[dict]) -> str:
+    """Детерминированная сводка языков для аспекта 16 (день 9, решение
+    Сергея): аспект качался, потому что модель каждый раз заново решала,
+    какие блоки есть по-русски. Считаем кодом по меткам lang регионов —
+    модель рассуждает от готовой сводки, а не собирает её заново."""
+    if not facts:
+        return ""
+    by_lang = Counter(f["lang"] for f in facts)
+    ru_kinds = sorted({f["kind"] for f in facts if f["lang"] in ("ru", "mixed")})
+    non_ru = sorted({f["kind"] for f in facts} - set(ru_kinds))
+    langs = ", ".join(f"{k}: {v}" for k, v in sorted(by_lang.items()))
+    return ("\nСВОДКА ЯЗЫКОВ (посчитано кодом по регионам макета): "
+            f"регионов по языкам — {langs}. "
+            f"Типы блоков, где есть русский текст (ru/mixed): "
+            f"{', '.join(ru_kinds) or '—'}. "
+            f"Типы блоков БЕЗ русского текста: {', '.join(non_ru) or '—'}. "
+            "Метки языков автоматические: спорные блоки перепроверь по самим "
+            "фактам.")
+
+
 # ── вердикт одного аспекта ───────────────────────────────────────────────────
 
 def build_user_prompt(aspect: dict, facts: list[dict], basis_chunks: list[dict],
@@ -449,9 +469,36 @@ def unresolved_clause_refs(explanation: str, citations: list[dict],
     return sorted(refs - have)
 
 
-def validate_verdict(raw: dict, allowed_chunks: list[dict]) -> dict:
+# Число с единицей °С или % в объяснении. Только эти две единицы (решение
+# Сергея, день 9, кейс «минус 12°С» из ниоткуда в аспекте 9): мм не нужен
+# (шрифт всегда ручная проверка), граммы дают ложняки — арифметика КБЖУ
+# легально порождает новые числа в граммах.
+_UNIT_NUM = re.compile(r"(\d+(?:[.,]\d+)?)\s*(?:°\s*[cс]|%)", re.I)
+
+
+def unresolved_unit_numbers(explanation: str, citations: list[dict],
+                            by_id: dict, extra_text: str = "") -> list[str]:
+    """Числа с °С / % из объяснения, которых нет ни в текстах процитированных
+    пунктов, ни в extra_text (факты макета + арифметическая сверка).
+    Запятая-разделитель нормализуется к точке с обеих сторон."""
+    refs = {m.group(1).replace(",", ".")
+            for m in _UNIT_NUM.finditer(explanation or "")}
+    if not refs:
+        return []
+    hay = " ".join([by_id[c["chunk_id"]]["text"]
+                    for c in citations if c["chunk_id"] in by_id]
+                   + [extra_text or ""])
+    hay = re.sub(r"(?<=\d),(?=\d)", ".", hay)
+    have = set(re.findall(r"\d+(?:\.\d+)?", hay))
+    return sorted(refs - have)
+
+
+def validate_verdict(raw: dict, allowed_chunks: list[dict],
+                     facts_text: str = "") -> dict:
     """Валидация ответа модели КОДОМ. Возвращает вердикт с полями
-    status/applicable/citations/explanation/downgraded_reason."""
+    status/applicable/citations/explanation/downgraded_reason.
+    facts_text — факты макета (+ арифметическая сверка): числа с °С / %
+    из объяснения сверяются и с ними, не только с цитатами."""
     by_id = {c["chunk_id"]: c for c in allowed_chunks}
     problems = []
 
@@ -488,15 +535,23 @@ def validate_verdict(raw: dict, allowed_chunks: list[dict]) -> dict:
         status = STATUS_MANUAL
 
     # Самодостаточность объяснения («день надёжности»): упомянул номер
-    # пункта — он обязан быть среди процитированного, иначе читатель отчёта
-    # не может проверить вывод.
+    # пункта или число с °С / % — они обязаны быть среди процитированного
+    # (числа — либо в фактах макета), иначе читатель отчёта не может
+    # проверить вывод.
     if status in (STATUS_COMPLIANT, STATUS_VIOLATION) and applicable:
-        missing_refs = unresolved_clause_refs(
-            raw.get("explanation") or "", citations, by_id)
-        if missing_refs:
-            downgraded = ("объяснение ссылается на пункты, которых нет среди "
-                          f"процитированных ({', '.join(missing_refs)}) — "
-                          "понижено автоматически (самодостаточность)")
+        expl = raw.get("explanation") or ""
+        missing_refs = unresolved_clause_refs(expl, citations, by_id)
+        missing_units = unresolved_unit_numbers(expl, citations, by_id,
+                                                facts_text)
+        if missing_refs or missing_units:
+            parts = []
+            if missing_refs:
+                parts.append(f"пункты ({', '.join(missing_refs)})")
+            if missing_units:
+                parts.append(f"значения с °С/% ({', '.join(missing_units)})")
+            downgraded = ("объяснение опирается на " + " и ".join(parts) +
+                          ", которых нет среди процитированных норм и фактов "
+                          "макета — понижено автоматически (самодостаточность)")
             status = STATUS_MANUAL
 
     return {"status": status, "applicable": applicable, "citations": citations,
@@ -538,8 +593,13 @@ def judge_aspect(aspect: dict, facts: list[dict], categories: set[str],
     allowed = basis_chunks + extra_chunks
 
     arith = nutrition_arithmetic(facts_text) if aspect["key"] == "nutrition" else None
-    user_prompt = build_user_prompt(aspect, facts, basis_chunks, extra_chunks,
-                                    categories) + arithmetic_note(arith)
+    user_prompt = (build_user_prompt(aspect, facts, basis_chunks, extra_chunks,
+                                     categories)
+                   + arithmetic_note(arith)
+                   + (language_note(facts) if aspect["key"] == "language" else ""))
+    # Числа с °С / % из объяснения сверяются с фактами макета и арифметикой
+    # (числа отклонений КБЖУ легитимны — они посчитаны кодом и есть в промпте).
+    facts_ctx = facts_text + arithmetic_note(arith)
 
     vcfg = cfg["verdict"]
     model = os.environ[vcfg["model_env"]]
@@ -551,7 +611,7 @@ def judge_aspect(aspect: dict, facts: list[dict], categories: set[str],
     for i in range(n_votes):
         raw = call_model(client, model, user_prompt, cfg, tally, use_cache,
                          salt=f"vote{i}" if i else "", aspect_key=aspect["key"])
-        votes.append(validate_verdict(raw, allowed))
+        votes.append(validate_verdict(raw, allowed, facts_ctx))
 
     verdict = votes[0]
     if n_votes > 1:

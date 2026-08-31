@@ -125,6 +125,25 @@ def test_vision_score_rejects_unknown_verdict():
         pass
 
 
+def test_judge_sees_full_chunk_and_check_rules():
+    """День 9: лимит 1500 обрезал процитированную норму (цитата аспекта 20
+    начиналась с позиции 1313) — судья видит полный чанк (max_chars нарезки
+    3500) и доменные правила проверки аспекта."""
+    assert J.MAX_CHUNK_CHARS >= 3500
+    verdict = {"name": "Тест", "status": "соответствует", "applicable": True,
+               "explanation": "x",
+               "citations": [{"chunk_id": "c1", "quote": "хвост нормы"}]}
+    long_text = "начало " + "а" * 3000 + " хвост нормы в самом конце"
+    user = J.build_judge_user(verdict, "факты", {"c1": long_text},
+                              check_text="даты на макете — шаблон DD/MM/YYYY")
+    assert "хвост нормы в самом конце" in user      # не обрезано
+    assert "ПРАВИЛА ПРОВЕРКИ АСПЕКТА" in user
+    assert "шаблон DD/MM/YYYY" in user
+    # без правил блок не появляется
+    user2 = J.build_judge_user(verdict, "факты", {"c1": "текст"})
+    assert "ПРАВИЛА ПРОВЕРКИ АСПЕКТА" not in user2
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]
     failed = 0

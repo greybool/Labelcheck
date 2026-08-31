@@ -2,141 +2,143 @@
  "strict": {
   "per_aspect": {
    "1": {
-    "n": 1,
+    "n": 3,
     "supported": 0,
-    "relevant_ok": 1,
-    "relevant_judged": 1,
-    "invented": 0
-   },
-   "2": {
-    "n": 1,
-    "supported": 0,
-    "relevant_ok": 0,
-    "relevant_judged": 1,
+    "relevant_ok": 2,
+    "relevant_judged": 3,
     "invented": 1
    },
-   "3": {
-    "n": 1,
+   "2": {
+    "n": 3,
     "supported": 1,
     "relevant_ok": 1,
-    "relevant_judged": 1,
+    "relevant_judged": 3,
+    "invented": 0
+   },
+   "3": {
+    "n": 3,
+    "supported": 3,
+    "relevant_ok": 3,
+    "relevant_judged": 3,
     "invented": 1
    },
    "4": {
-    "n": 1,
+    "n": 3,
     "supported": 0,
-    "relevant_ok": 1,
-    "relevant_judged": 1,
-    "invented": 0
+    "relevant_ok": 3,
+    "relevant_judged": 3,
+    "invented": 3
    },
    "5": {
-    "n": 1,
-    "supported": 0,
-    "relevant_ok": 1,
-    "relevant_judged": 1,
+    "n": 3,
+    "supported": 1,
+    "relevant_ok": 3,
+    "relevant_judged": 3,
     "invented": 0
    },
    "6": {
-    "n": 1,
-    "supported": 1,
-    "relevant_ok": 1,
-    "relevant_judged": 1,
+    "n": 3,
+    "supported": 2,
+    "relevant_ok": 3,
+    "relevant_judged": 3,
     "invented": 0
    },
    "7": {
-    "n": 1,
-    "supported": 0,
-    "relevant_ok": 1,
-    "relevant_judged": 1,
-    "invented": 1
-   },
-   "8": {
-    "n": 1,
-    "supported": 0,
-    "relevant_ok": 1,
-    "relevant_judged": 1,
+    "n": 3,
+    "supported": 3,
+    "relevant_ok": 3,
+    "relevant_judged": 3,
     "invented": 0
    },
+   "8": {
+    "n": 3,
+    "supported": 1,
+    "relevant_ok": 3,
+    "relevant_judged": 3,
+    "invented": 2
+   },
    "9": {
-    "n": 1,
+    "n": 3,
     "supported": 0,
     "relevant_ok": 0,
-    "relevant_judged": 1,
-    "invented": 1
+    "relevant_judged": 3,
+    "invented": 3
    },
    "10": {
-    "n": 1,
-    "supported": 0,
-    "relevant_ok": 1,
-    "relevant_judged": 1,
+    "n": 3,
+    "supported": 2,
+    "relevant_ok": 3,
+    "relevant_judged": 3,
     "invented": 1
    },
    "11": {
-    "n": 1,
-    "supported": 1,
-    "relevant_ok": 1,
-    "relevant_judged": 1,
+    "n": 3,
+    "supported": 3,
+    "relevant_ok": 3,
+    "relevant_judged": 3,
     "invented": 0
    },
    "12": {
-    "n": 1,
+    "n": 3,
     "supported": 0,
-    "relevant_ok": 0,
-    "relevant_judged": 1,
-    "invented": 0
+    "relevant_ok": 3,
+    "relevant_judged": 3,
+    "invented": 3
    },
    "13": {
-    "n": 1,
+    "n": 3,
     "supported": 1,
     "relevant_ok": 1,
-    "relevant_judged": 1,
-    "invented": 0
+    "relevant_judged": 3,
+    "invented": 1
    },
    "14": {
-    "n": 1,
-    "supported": 1,
-    "relevant_ok": 1,
-    "relevant_judged": 1,
-    "invented": 0
+    "n": 3,
+    "supported": 2,
+    "relevant_ok": 2,
+    "relevant_judged": 3,
+    "invented": 1
    },
    "15": {
-    "n": 1,
+    "n": 3,
     "supported": 1,
-    "relevant_ok": 1,
-    "relevant_judged": 1,
-    "invented": 0
+    "relevant_ok": 3,
+    "relevant_judged": 3,
+    "invented": 1
    },
    "16": {
-    "n": 1,
+    "n": 3,
     "supported": 1,
-    "relevant_ok": 1,
-    "relevant_judged": 1,
+    "relevant_ok": 3,
+    "relevant_judged": 3,
     "invented": 0
    },
    "20": {
-    "n": 1,
+    "n": 3,
     "supported": 0,
-    "relevant_ok": 0,
-    "relevant_judged": 1,
+    "relevant_ok": 1,
+    "relevant_judged": 3,
     "invented": 1
    },
    "21": {
-    "n": 1,
+    "n": 3,
     "supported": 1,
-    "relevant_ok": 1,
-    "relevant_judged": 1,
-    "invented": 0
+    "relevant_ok": 2,
+    "relevant_judged": 3,
+    "invented": 1
    }
   },
   "total": {
-   "n": 18,
-   "supported": 8,
-   "invented": 6,
-   "relevant_ok": 14,
-   "relevant_judged": 18
+   "n": 54,
+   "supported": 22,
+   "invented": 19,
+   "relevant_ok": 42,
+   "relevant_judged": 54
   },
   "runs": [
-   "run1"
+   "run1",
+   "run2",
+   "run3"
   ],
   "judge_model": "gpt-5.4-mini-2026-03-17"
  },
