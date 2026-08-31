@@ -83,7 +83,11 @@ SYSTEM_PROMPT = """Ты — проверяющий маркировку пище
    сырья: бескостное мясо или мехобвалка»). Голое «подтвердить нельзя» —
    недостаточно.
 4. Проверяй только формальное соответствие маркировки; достоверность
-   заявленных значений по существу не оцениваешь.
+   заявленных значений по существу не оцениваешь. При статусе «возможное
+   нарушение» объяснение обязано заканчиваться одним-двумя простыми
+   предложениями: ЧТО именно на макете не так, КАК должно быть по
+   процитированной норме и что исправить — читатель отчёта не обязан
+   реконструировать вывод из рассуждений.
 5. Тебе передан не весь регламент: ОТСУТСТВИЕ в списке пункта,
    подтверждающего разрешённость или требование, — не доказательство
    нарушения. Не хватает нормы для вывода — «требует ручной проверки»."""
@@ -398,14 +402,66 @@ def gather_context(aspect: dict, categories: set[str], chunks: list[dict],
 # ── арифметика пищевой ценности (без LLM; коэффициенты — прил.4 к 022) ──────
 
 _NUTR_NUM = r"(\d+(?:[.,]\d+)?)"
+_KCAL_PER_KJ = 4.184  # 1 ккал = 4,184 кДж (для сверки согласованности записи)
 
 
-def _find_value(text: str, *labels: str) -> float | None:
-    for label in labels:
-        m = re.search(label + r"[^\d\n]{0,20}" + _NUTR_NUM, text, re.I)
+def _num(s: str) -> float:
+    return float(s.replace(",", "."))
+
+
+def _label_values(text: str, labels: dict[str, str]) -> dict[str, float]:
+    """Значения нутриентов; направление записи определяется по ВСЕМУ тексту.
+
+    Макеты пишут в двух порядках: «белки 1 г» и «1 г белки» (кейс mango,
+    день 9). Пометка направления по каждой метке отдельно даёт смещение
+    («белки» цепляют число следующего нутриента), поэтому сначала пробуем
+    оба направления целиком и выбираем то, которое нашло больше нутриентов:
+    порядок записи на одном макете единый."""
+    other = r"(?:белк|жир|углевод|ккал|кдж|кало)"
+    num = r"(?P<num>\d+(?:[.,]\d+)?)"
+    found = ({}, {})  # 0 — «метка → число», 1 — «число → метка»
+    for key, label in labels.items():
+        pats = (label + r"(?P<gap>[^\d\n]{0,12})" + num,
+                num + r"(?P<gap>\s*(?:г|g)?[^\d\n]{0,6}?)" + label)
+        for i, pat in enumerate(pats):
+            for m in re.finditer(pat, text, re.I):
+                if re.search(other, m.group("gap"), re.I):
+                    continue  # между числом и меткой другой нутриент — не наше
+                found[i].setdefault(key, _num(m.group("num")))
+                break
+    forward, backward = found
+    return backward if len(backward) > len(forward) else forward
+
+
+def _find_value(text: str, label: str) -> float | None:
+    """Одно значение по метке (энергия и одиночные показатели)."""
+    return _label_values(text, {"v": label}).get("v")
+
+
+def _find_energy(text: str) -> tuple[float | None, float | None]:
+    """Заявленные ккал и кДж. Поддержаны форматы: «268 кДж / 64 ккал»,
+    «64 ккал / 268 кДж», компактная запись макета «64/268 ккал кДж»
+    (значения через дробь, единицы следом — день 9, кейс mango) и
+    одиночные упоминания. Пара всегда сверяется по 4,184: если числа
+    не согласуются, порядок пробуем поменять местами."""
+    pair = re.search(_NUTR_NUM + r"\s*/\s*" + _NUTR_NUM +
+                     r"\s*(ккал\s*[/,]?\s*кдж|кдж\s*[/,]?\s*ккал)",
+                     text, re.I)
+    if pair:
+        a, b, units = _num(pair.group(1)), _num(pair.group(2)), pair.group(3).lower()
+        return (a, b) if units.startswith("ккал") else (b, a)
+    for first, second, order in ((r"кДж", r"ккал", "kj"), (r"ккал", r"кДж", "kcal")):
+        m = re.search(_NUTR_NUM + r"\s*" + first + r"\s*[/,]?\s*" +
+                      _NUTR_NUM + r"\s*" + second, text, re.I)
         if m:
-            return float(m.group(1).replace(",", "."))
-    return None
+            x, y = _num(m.group(1)), _num(m.group(2))
+            return (y, x) if order == "kj" else (x, y)
+    kcal = _find_value(text, r"ккал")
+    kj = _find_value(text, r"кДж")
+    if kcal and kj and abs(kj / kcal - _KCAL_PER_KJ) > 0.6 and \
+            abs(kcal / kj - _KCAL_PER_KJ) < 0.6:
+        kcal, kj = kj, kcal  # значения явно перепутаны местами при чтении
+    return kcal, kj
 
 
 def nutrition_arithmetic(facts_text: str) -> dict | None:
@@ -413,16 +469,10 @@ def nutrition_arithmetic(facts_text: str) -> dict | None:
     4 ккал/г и 17 кДж/г, жиры — 9 ккал/г и 37 кДж/г, прил.4 к 022).
     Возвращает расчёт для промпта вердикта и отчёта; None — если значения
     не распарсились. Спирт/полиолы в расчёт не входят (v1, отметка ниже)."""
-    protein = _find_value(facts_text, r"белки")
-    fat = _find_value(facts_text, r"жиры")
-    carbs = _find_value(facts_text, r"углеводы")
-    m = re.search(_NUTR_NUM + r"\s*кДж\s*/\s*" + _NUTR_NUM + r"\s*ккал", facts_text, re.I)
-    if m:
-        stated_kj, stated_kcal = (float(m.group(1).replace(",", ".")),
-                                  float(m.group(2).replace(",", ".")))
-    else:
-        stated_kcal = _find_value(facts_text, r"ккал")
-        stated_kj = _find_value(facts_text, r"кДж")
+    vals = _label_values(facts_text, {"protein": r"белк\w*", "fat": r"жир\w*",
+                                      "carbs": r"углевод\w*"})
+    protein, fat, carbs = vals.get("protein"), vals.get("fat"), vals.get("carbs")
+    stated_kcal, stated_kj = _find_energy(facts_text)
     if None in (protein, fat, carbs) or (stated_kcal is None and stated_kj is None):
         return None
     calc_kcal = round(protein * 4 + carbs * 4 + fat * 9, 1)
@@ -850,7 +900,7 @@ def detect_categories(layout: dict,
 def check_layout(layout: dict, retriever, client, cfg: dict | None = None,
                  aspects_data: dict | None = None, search_fn=None,
                  categories_override: set[str] | None = None,
-                 use_cache: bool = False) -> dict:
+                 use_cache: bool = False, progress_cb=None) -> dict:
     """Все вердикты по макету → структура отчёта (сериализуемый dict).
 
     categories_override — решение Сергея («кнопки»): None = автодетект по
@@ -862,6 +912,8 @@ def check_layout(layout: dict, retriever, client, cfg: dict | None = None,
     по умолчанию ВЫКЛЮЧЕН (тесты и замеры стабильности детерминированы без
     оглядки на кэш); CLI check включает его по умолчанию, флаг --no-cache
     выключает.
+    progress_cb(done, total, name) — необязательный колбэк прогресса
+    (UI показывает, какой аспект проверяется; done — сколько уже готово).
     """
     from labelcheck.rewrite import hybrid_search_rewritten  # локально: цикл импортов
 
@@ -889,7 +941,10 @@ def check_layout(layout: dict, retriever, client, cfg: dict | None = None,
     facts = collect_facts(layout)  # весь макет, один раз на прогон
 
     verdicts, other = [], []
-    for aspect in aspects_data["aspects"]:
+    total = len(aspects_data["aspects"])
+    for i, aspect in enumerate(aspects_data["aspects"]):
+        if progress_cb:
+            progress_cb(i, total, f"{aspect['id']}. {aspect['name']}")
         if aspect["group"] == "regulatory":
             verdicts.append(judge_aspect(aspect, facts, categories, chunks,
                                          search_fn, client, cfg, tally,
@@ -898,6 +953,8 @@ def check_layout(layout: dict, retriever, client, cfg: dict | None = None,
             other.append(barcode_check(layout))
         elif aspect["key"] == "spelling":
             other.append(spelling_check(facts, client, cfg, tally, layout))
+    if progress_cb:
+        progress_cb(total, total, "готово")
 
     manual_regions = [
         {"id": r["id"], "kind": r["kind"], "reason": r.get("status_reason") or ""}

@@ -42,6 +42,11 @@ data/reports/
 # Кэш ответов вердикт-модели (в промптах — тексты реальных макетов)
 data/verdict_cache.json
 
+# UI (блок C): база фидбека и загруженные через UI макеты
+data/labelcheck.db
+data/ui_uploads/
+data/actions_cache.json
+
 # Кэши оценки Дня 7 — пересоздаваемые (evaluation/runs/ и metrics/ — в git)
 data/gt_embeddings.npz
 evaluation/ground_truth.partial.jsonl

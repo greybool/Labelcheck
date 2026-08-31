@@ -223,6 +223,53 @@ def test_nutrition_arithmetic():
     assert V.nutrition_arithmetic("тут нет цифр") is None
 
 
+def test_nutrition_reversed_order_no_shift():
+    """Число ПЕРЕД меткой («1 г белки») — значения не смещаются к соседнему
+    нутриенту (баг дня 9, кейс mango: белки получали число жиров)."""
+    text = ("Пищевая и энергетическая ценность в 100 г продукта:\n"
+            "64/268 ккал кДж 1 г белки 0,2 г жиры 16,3 г углеводы")
+    a = V.nutrition_arithmetic(text)
+    assert a, "обратный порядок записи не распарсился"
+    assert (a["protein_g"], a["fat_g"], a["carbs_g"]) == (1.0, 0.2, 16.3)
+    assert (a["stated_kcal"], a["stated_kj"]) == (64.0, 268.0)
+
+
+def test_nutrition_energy_formats():
+    """Компактная запись энергии в обоих порядках единиц + одиночные ккал."""
+    kcal_first = V._find_energy("112 ккал / 470 кДж")
+    kj_first = V._find_energy("470 кДж / 112 ккал")
+    compact = V._find_energy("64/268 ккал кДж")
+    compact_rev = V._find_energy("268/64 кДж/ккал")
+    assert kcal_first == kj_first == (112.0, 470.0)
+    assert compact == compact_rev == (64.0, 268.0)
+    assert V._find_energy("Энергетическая ценность: 127 ккал") == (127.0, None)
+
+
+def test_energy_format_rule_in_aspect_6():
+    """Правило дня 9: компактная запись «64/268 ккал кДж» — не нарушение
+    (ложное срабатывание на mango, подтверждено Сергеем)."""
+    check = BY_ID[6]["check"]
+    assert "64/268" in check and "НЕ нарушение" in check
+
+
+def test_aspect_21_renamed_without_jargon():
+    """Аспект 21 назван по-русски, без «клеймов» (решение Сергея)."""
+    assert BY_ID[21]["name"] == "Заявленные особенности"
+
+
+def test_progress_callback_reports_every_aspect():
+    """check_layout зовёт progress_cb на каждый аспект и в конце — UI
+    показывает, что именно проверяется (проверка идёт минуты)."""
+    client = FakeClient([{"status": V.STATUS_MANUAL, "applicable": True,
+                          "citations": [], "explanation": "заглушка"}])
+    seen = []
+    V.check_layout(LAYOUT, RETRIEVER, client, CFG, DATA, search_fn=no_search,
+                   progress_cb=lambda d, t, n: seen.append((d, t, n)))
+    assert len(seen) == len(DATA["aspects"]) + 1, len(seen)
+    assert seen[-1][0] == seen[-1][1] == len(DATA["aspects"])
+    assert "Наименование" in seen[0][2]
+
+
 def test_layer_word_findings_homoglyph():
     """Слова слоя, не найденные в vision-тексте, доходят до отчёта;
     кир/лат-микс помечается как гомоглифная опечатка («Hалейте»)."""

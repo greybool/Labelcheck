@@ -47,6 +47,19 @@ rewrite:
     «потребительская упаковка»). Сохраняй смысл запроса, не расширяй и не
     сужай его. Верни JSON: {{"rewrites": ["...", "..."]}}
 
+actions:
+  # План работ (день 9): короткие пункты «что делать» без цитат регламентов —
+  # для дизайнера, поставщика и ручной проверки. Один дешёвый вызов на отчёт
+  # (пересказ готовых вердиктов, вердикты не переспрашиваются).
+  model_env: CHEAP_MODEL
+  cache: data/actions_cache.json   # НЕ в git — пересказ текстов макета
+
+ui:
+  # Streamlit-приложение (блок C, день 9): streamlit run labelcheck/app.py
+  db: data/labelcheck.db        # SQLite: журнал проверок + фидбек (НЕ в git)
+  uploads_dir: data/ui_uploads  # PDF, загруженные через UI (НЕ в git)
+  reports_dir: data/reports/ui  # отчёты, запущенные из UI (в data/reports, не в git)
+
 eval:
   # Retrieval evaluation (День 7): эталон вопросов + прогоны метрик.
   # Все решения — docs/TZ-LABELCHECK.md §5.1/§5.4 и evaluation/EVALUATION.md.
