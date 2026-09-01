@@ -2,18 +2,16 @@
 
     streamlit run labelcheck/app.py
 
-Три шага по сценарию ТЗ §2, каждый заканчивается кнопкой перехода:
-1. «Макет» — PDF → vision → просмотр с зумом и кликом по регионам, правка
-   текста ЧЕЛОВЕКОМ до вердиктов (правки в layout-JSON, история в edits).
-2. «Проверка» — выбор профильных регламентов → вердикты по 21 аспекту →
-   отчёт с цитатами; под каждым вердиктом оценка ответа системы и решение,
-   что с ним делать (всё пишется в SQLite, labelcheck/store.py).
-3. «План работ» — короткие списки без цитат регламентов: дизайнеру,
-   поставщику, проверить самому; выгрузка в Markdown и Word.
+Три шага, между ними — кнопки перехода (навигация состоянием, не вкладками:
+вкладки Streamlit нельзя переключить из кода, а «Далее» должна работать):
 
-Правки UI по замечаниям Сергея (31.08): человеческие формулировки вместо
-внутренних терминов, категории кнопками, живой прогресс по аспектам,
-фидбек рядом с вердиктом, план работ как итоговый документ.
+1. «Макет» — PDF → vision → просмотр с масштабом и выбором блоков кликом,
+   правка текста ЧЕЛОВЕКОМ до вердиктов (правки в layout-JSON).
+2. «Проверка» — выбор профильных регламентов → вердикты по 21 аспекту →
+   по каждому замечанию: решение «что делать» и оценка ответа системы,
+   сохраняются САМИ (кнопок «сохранить» нет).
+3. «План работ» — короткие списки без цитат регламентов: дизайнеру,
+   поставщику, проверить самому; копирование и выгрузка в Markdown/Word.
 """
 
 import html
@@ -33,8 +31,8 @@ from labelcheck.actions import (TARGETS, apply_human_decisions, build_plan,
                                 plan_to_docx, render_plan_markdown)
 from labelcheck.retrieval import ROOT, Retriever, load_config
 from labelcheck.store import (apply_region_edit, connect, fetch_checks,
-                              fetch_feedback, record_check, record_feedback,
-                              save_layout)
+                              fetch_feedback, record_check, save_layout,
+                              upsert_feedback)
 from labelcheck.verdict import (STATUS_COMPLIANT, STATUS_MANUAL,
                                 STATUS_VIOLATION, check_layout,
                                 render_markdown)
@@ -49,37 +47,32 @@ UI_REPORTS_DIR = ROOT / CFG["ui"]["reports_dir"]
 ICONS = {STATUS_VIOLATION: "🔴", STATUS_MANUAL: "🟡", STATUS_COMPLIANT: "🟢"}
 REGION_COLORS = {"прочитано": (46, 160, 67), "требует ручной проверки": (219, 154, 4)}
 
-# Профильные регламенты человеческим языком (внутренние ключи не показываем).
-CATEGORY_LABELS = {
-    "meat": "🥩 Мясная продукция",
-    "poultry": "🍗 Продукция из мяса птицы",
-    "fish": "🐟 Рыба и морепродукты",
-}
-CATEGORY_HINTS = {
-    "meat": "ТР ТС 034/2013 — мясо и мясная продукция",
-    "poultry": "ТР ЕАЭС 051/2021 — мясо птицы",
-    "fish": "ТР ЕАЭС 040/2016 — рыба и морепродукты",
-}
-# Что делать с замечанием: ключ → (подпись, пояснение)
-DECISIONS = {
-    "none": ("Ничего не требуется", "замечание снято"),
-    "designer": ("Замечание дизайнеру", "поправить в макете"),
-    "supplier": ("Запросить у поставщика", "нужны данные производителя"),
-    "manual": ("Проверить самому", "смотрю вручную"),
-}
+STEPS = ["1 · Макет", "2 · Проверка", "3 · План работ"]
+ZOOM_STEPS = [50, 75, 100, 150, 200, 300]
+
+CATEGORY_LABELS = {"meat": "🥩 Мясная продукция",
+                   "poultry": "🍗 Продукция из мяса птицы",
+                   "fish": "🐟 Рыба и морепродукты"}
+CATEGORY_HINTS = {"meat": "ТР ТС 034/2013 — мясо и мясная продукция",
+                  "poultry": "ТР ЕАЭС 051/2021 — мясо птицы",
+                  "fish": "ТР ЕАЭС 040/2016 — рыба и морепродукты"}
+# Решение по замечанию: ключ → (подпись, пояснение)
+DECISIONS = {"none": ("Ничего не требуется", "замечание снято"),
+             "designer": ("Замечание дизайнеру", "поправить в макете"),
+             "supplier": ("Запросить у поставщика", "нужны данные производителя"),
+             "manual": ("Проверить самому", "смотрю вручную")}
+RATINGS = ["не оценивал", "👍 верно", "👎 система ошиблась"]
 
 
 # ── кэшируемые тяжёлые объекты ───────────────────────────────────────────────
 
 @st.cache_resource(show_spinner=False)
 def get_retriever_and_client():
-    """Индексы и OpenAI-клиент — один раз на процесс Streamlit."""
     from dotenv import load_dotenv
     from openai import OpenAI
     load_dotenv(ROOT / ".env")
     client = OpenAI()
-    retriever = Retriever(CFG, openai_client=client)
-    return retriever, client
+    return Retriever(CFG, openai_client=client), client
 
 
 @st.cache_data(show_spinner=False)
@@ -88,12 +81,18 @@ def rendered_page(pdf_path: str, mtime: float):
     return render.render_page(pdf_path, scale=2)
 
 
-def draw_regions(img, regions, selected_id=None, label_regions=True):
-    """Рамки регионов с подписями (номер и тип) поверх рендера."""
-    out = img.convert("RGB").copy()
-    d = ImageDraw.Draw(out)
-    w, h = out.size
-    size = max(13, int(min(w, h) * 0.016))
+@st.cache_data(show_spinner=False)
+def overlay_image(pdf_path: str, mtime: float, regions_key: str,
+                  selected_id: str | None, width: int):
+    """Рендер с рамками и подписями, отмасштабированный под ширину просмотра.
+    Кэш по ключу (макет, набор рамок, выбранный блок, ширина) — перелистывание
+    блоков и зум не пересобирают картинку заново."""
+    regions = json.loads(regions_key)
+    base = rendered_page(pdf_path, mtime)
+    img = base.convert("RGB").copy()
+    d = ImageDraw.Draw(img)
+    w, h = img.size
+    size = max(14, int(min(w, h) * 0.018))
     try:
         font = ImageFont.truetype("DejaVuSans.ttf", size)
     except OSError:
@@ -106,18 +105,98 @@ def draw_regions(img, regions, selected_id=None, label_regions=True):
         chosen = r["id"] == selected_id
         color = ((31, 111, 235) if chosen
                  else REGION_COLORS.get(r.get("status"), (110, 110, 110)))
-        d.rectangle([x0, y0, x1, y1], outline=color, width=5 if chosen else 3)
-        if label_regions:
-            tag = f"{r['id']} · {r['kind']}"
-            tw = d.textlength(tag, font=font)
-            ty = max(0, y0 - size - 6)
-            d.rectangle([x0, ty, x0 + tw + 8, ty + size + 6], fill=color)
-            d.text((x0 + 4, ty + 3), tag, fill=(255, 255, 255), font=font)
-    return out
+        d.rectangle([x0, y0, x1, y1], outline=color, width=6 if chosen else 3)
+        tag = f"{r['id']} · {r['kind']}"
+        tw = d.textlength(tag, font=font)
+        ty = max(0, y0 - size - 6)
+        d.rectangle([x0, ty, x0 + tw + 8, ty + size + 6], fill=color)
+        d.text((x0 + 4, ty + 3), tag, fill=(255, 255, 255), font=font)
+    return img.resize((width, max(1, int(img.height * width / img.width))),
+                      Image.LANCZOS)
+
+
+@st.cache_data(show_spinner=False)
+def region_crop(pdf_path: str, mtime: float, bbox_json: str, width: int):
+    """Увеличенный фрагмент вокруг выбранного блока (решение Сергея вместо
+    перетаскивания мышью: практическая задача — рассмотреть мелкий текст).
+    Паддинг 3% стороны, чтобы блок не упирался в край."""
+    bbox = json.loads(bbox_json)
+    if not bbox:
+        return None
+    base = rendered_page(pdf_path, mtime)
+    w, h = base.size
+    pad_x, pad_y = 0.03 * w, 0.03 * h
+    box = (max(0, bbox[0] * w - pad_x), max(0, bbox[1] * h - pad_y),
+           min(w, bbox[2] * w + pad_x), min(h, bbox[3] * h + pad_y))
+    crop = base.crop(tuple(int(v) for v in box))
+    if crop.width < 5 or crop.height < 5:
+        return None
+    scale = max(1.0, width / crop.width)
+    return crop.resize((int(crop.width * scale), int(crop.height * scale)),
+                       Image.LANCZOS)
+
+
+def load_click_component():
+    """Компонент кликов по картинке. Возвращает функцию или None, положив
+    причину в session_state: «пакет установлен, а приложение говорит, что
+    нет» бывает при установке в другую среду или смене API — пользователю
+    нужна настоящая причина, а не общая фраза."""
+    try:
+        import streamlit_image_coordinates as m
+    except Exception as e:  # noqa: BLE001
+        st.session_state["click_component_error"] = f"{type(e).__name__}: {e}"
+        return None
+    for attr in ("streamlit_image_coordinates", "image_coordinates", "main"):
+        fn = getattr(m, attr, None)
+        if callable(fn):
+            return fn
+    st.session_state["click_component_error"] = (
+        f"в пакете {getattr(m, '__file__', '?')} нет функции "
+        "streamlit_image_coordinates")
+    return None
+
+
+TOP_ANCHOR_ID = "labelcheck-top"
+
+
+def top_anchor():
+    """Невидимая метка в самом верху страницы — цель прокрутки при смене
+    шага. Якорь надёжнее, чем прокрутка контейнера: не нужно угадывать,
+    какой именно элемент Streamlit прокручивает в текущей версии."""
+    st.markdown(f"<div id='{TOP_ANCHOR_ID}'></div>", unsafe_allow_html=True)
+
+
+def scroll_to_top():
+    """Прокрутка к метке верха после смены шага.
+
+    Streamlit сохраняет позицию прокрутки при перерисовке, и пользователь
+    попадает в середину нового шага. Прокручиваем к якорю через
+    scrollIntoView (работает независимо от того, скроллится документ или
+    внутренний контейнер) и повторяем, пока страница дорисовывается:
+    на длинном третьем шаге вёрстка завершается позже первой попытки."""
+    st.iframe(
+        f"""<script>
+        const ID = "{TOP_ANCHOR_ID}";
+        function up() {{
+          try {{
+            const doc = window.parent.document;
+            const el = doc.getElementById(ID);
+            if (el) el.scrollIntoView({{block: "start", behavior: "instant"}});
+            (doc.scrollingElement || doc.documentElement).scrollTop = 0;
+            doc.querySelectorAll('section.main, div[data-testid="stMain"], '
+              + 'div[data-testid="stAppViewContainer"], '
+              + 'div[data-testid="stMainBlockContainer"]')
+              .forEach(n => {{ try {{ n.scrollTop = 0; }} catch (e) {{}} }});
+            window.parent.scrollTo(0, 0);
+          }} catch (e) {{ /* песочница закрыла доступ — молча выходим */ }}
+        }}
+        [0, 50, 150, 300, 600, 1000, 1600, 2400].forEach(ms => setTimeout(up, ms));
+        </script>""",
+        height=1)   # 0 недопустим: Streamlit требует положительную высоту
 
 
 def region_at(regions, x_rel, y_rel):
-    """Регион под кликом (самый маленький из попавших — вложенные рамки)."""
+    """Блок под кликом (самый маленький из попавших — вложенные рамки)."""
     hits = [r for r in regions
             if r.get("bbox") and r["bbox"][0] <= x_rel <= r["bbox"][2]
             and r["bbox"][1] <= y_rel <= r["bbox"][3]]
@@ -139,20 +218,46 @@ def find_source_pdf(layout: dict) -> Path | None:
 
 
 def quote_block(text: str, address: str):
-    """Цитата пункта регламента. Через HTML, а не markdown: текст пункта
-    часто начинается с «3. …» — markdown превращал его в нумерованный
-    список и ломал отступы и цвет (замечание Сергея 31.08)."""
+    """Цитата пункта регламента через HTML: текст пункта часто начинается
+    с «3. …», и markdown превращал его в нумерованный список, ломая
+    отступы и цвет (замечание Сергея 31.08)."""
     body = html.escape(text).replace("\n", "<br>")
     st.markdown(
         f"<div style='border-left:3px solid #9aa0a6;padding:6px 12px;"
-        f"margin:6px 0;background:rgba(150,150,150,.08);color:inherit;'>"
+        f"margin:6px 0;background:rgba(150,150,150,.08);'>"
         f"<div style='opacity:.75;font-size:.85em;margin-bottom:4px'>"
         f"📖 {html.escape(address)}</div>{body}</div>",
         unsafe_allow_html=True)
 
 
+def copy_button(text: str, label: str = "📋 Скопировать текст"):
+    """Всегда видимая кнопка копирования (встроенная в st.code появляется
+    только при наведении). Работает через буфер обмена браузера с запасным
+    вариантом execCommand для строгих настроек."""
+    payload = json.dumps(text)
+    st.iframe(
+        f"""
+        <button id="cp" style="width:100%;padding:.55rem 1rem;font-size:15px;
+            border-radius:.5rem;border:1px solid rgba(120,120,120,.5);
+            background:#fff;cursor:pointer;">{label}</button>
+        <script>
+        const txt = {payload};
+        const btn = document.getElementById('cp');
+        btn.onclick = async () => {{
+          try {{ await navigator.clipboard.writeText(txt); }}
+          catch (e) {{
+            const ta = document.createElement('textarea');
+            ta.value = txt; document.body.appendChild(ta); ta.select();
+            document.execCommand('copy'); ta.remove();
+          }}
+          btn.textContent = '✅ Скопировано';
+          setTimeout(() => btn.textContent = {json.dumps(label)}, 1800);
+        }};
+        </script>
+        """, height=52)
+
+
 def human_summary(meta: dict) -> str:
-    """Подпись отчёта человеческим языком (было: «охват детекта: targeted»)."""
     cats = meta.get("categories") or {}
     if cats:
         names = ", ".join(CATEGORY_LABELS.get(c, c).split(" ", 1)[-1] for c in cats)
@@ -165,29 +270,80 @@ def human_summary(meta: dict) -> str:
                    "в продукте не обнаружены — проверка по общим правилам "
                    "маркировки")
     sec = meta.get("seconds") or 0
-    dur = (f"{int(sec // 60)} мин {int(sec % 60)} с" if sec >= 60
-           else f"{int(sec)} с")
+    dur = (f"{int(sec // 60)} мин {int(sec % 60)} с" if sec >= 60 else f"{int(sec)} с")
     return f"{cat_txt}. Проверка заняла {dur}."
 
 
-# ── состояние сессии ─────────────────────────────────────────────────────────
+# ── состояние ────────────────────────────────────────────────────────────────
 
 ss = st.session_state
 for key, default in (("layout", None), ("layout_path", None), ("report", None),
                      ("check_id", None), ("plan", None), ("sel_region", None),
-                     ("zoom", 1.0), ("step", 0), ("saved_ids", set())):
+                     ("nav", STEPS[0]), ("zoom", 100)):
     ss.setdefault(key, default)
 
+
+def go_to(step_name: str):
+    ss.nav = step_name
+    ss.scroll_top = True   # новый шаг открывается сверху, а не с середины
+
+
+def save_decision(aspect_id: int, aspect_name: str, status: str):
+    """Автосохранение оценки: вызывается при изменении любого виджета
+    (кнопок «сохранить» в интерфейсе нет — замечание Сергея 31.08)."""
+    if not ss.check_id:
+        return
+    rating = ss.get(f"rate_{aspect_id}", RATINGS[0])
+    con = connect()
+    try:
+        upsert_feedback(
+            con, ss.check_id, aspect_id, aspect_name, status,
+            rating=("up" if str(rating).startswith("👍")
+                    else "down" if str(rating).startswith("👎") else None),
+            note=ss.get(f"note_{aspect_id}", ""),
+            note_type=ss.get(f"dec_{aspect_id}", "none"))
+    finally:
+        con.close()
+
+
+def decision_widgets(aspect_id: int, aspect_name: str, status: str,
+                     default_decision: str, note_hint: str = ""):
+    """Решение (слева, главное) и оценка ответа системы (справа) с
+    автосохранением. Порядок по замечанию Сергея: сначала «что делать»."""
+    st.markdown("---")
+    left, right = st.columns([2, 1])
+    keys = list(DECISIONS)
+    left.selectbox(
+        "Что делать с замечанием", keys,
+        index=keys.index(ss.get(f"dec_{aspect_id}", default_decision)),
+        key=f"dec_{aspect_id}",
+        format_func=lambda k: f"{DECISIONS[k][0]} — {DECISIONS[k][1]}",
+        on_change=save_decision, args=(aspect_id, aspect_name, status))
+    right.radio(
+        "Оцените ответ системы", RATINGS, key=f"rate_{aspect_id}",
+        help="Оценка не меняет вердикт: это журнал качества системы. "
+             "«Система ошиблась» убирает пункт из плана работ.",
+        on_change=save_decision, args=(aspect_id, aspect_name, status))
+    st.text_input(
+        "Своими словами (попадёт в план работ вместо формулировки системы)",
+        key=f"note_{aspect_id}", placeholder=note_hint,
+        on_change=save_decision, args=(aspect_id, aspect_name, status))
+
+
+top_anchor()
 st.title("🏷️ LabelCheck — проверка макета упаковки по ТР ЕАЭС")
 st.caption("Инструмент предварительной проверки. Финальное решение — "
            "за специалистом и юристом.")
-
-tabs = st.tabs(["1 · Макет", "2 · Проверка", "3 · План работ"])
+st.segmented_control("Шаг", STEPS, key="nav", label_visibility="collapsed")
+step = ss.nav or STEPS[0]
+if ss.pop("scroll_top", False):
+    scroll_to_top()
+st.divider()
 
 
 # ═════════════════════════════ 1 · МАКЕТ ═════════════════════════════════════
 
-with tabs[0]:
+if step == STEPS[0]:
     st.subheader("Шаг 1. Загрузите макет и проверьте распознанный текст")
     st.markdown("Система читает макет и раскладывает его на блоки. "
                 "**Прочитанный текст можно поправить** — проверка пойдёт "
@@ -237,9 +393,8 @@ with tabs[0]:
         cov = layout.get("text_layer_coverage")
         st.markdown(f"**{meta.get('source_pdf', '—')}** · блоков: {len(regions)}")
         if isinstance(cov, (int, float)):
-            st.caption(f"Текст макета сверен с текстовым слоем PDF на "
-                       f"{cov * 100:.0f}% — опечатки и подмены букв "
-                       f"отслеживаются автоматически.")
+            st.caption(f"Текст сверен с текстовым слоем PDF на {cov * 100:.0f}% — "
+                       "опечатки и подмены букв отслеживаются автоматически.")
         else:
             st.warning("В этом PDF нет текстового слоя (шрифты в кривых): "
                        "автоматическая сверка опечаток невозможна — "
@@ -248,110 +403,175 @@ with tabs[0]:
             st.warning("Не найдены обязательные блоки: " +
                        ", ".join(layout["missing"]))
 
-        if ss.sel_region not in [r["id"] for r in regions]:
-            ss.sel_region = regions[0]["id"] if regions else None
+        ids = [r["id"] for r in regions]
+        if ss.sel_region not in ids:
+            ss.sel_region = ids[0] if ids else None
+        if "region_pick" not in ss and ss.sel_region:
+            ss.region_pick = ss.sel_region
 
-        col_img, col_edit = st.columns([3, 2], gap="large")
+        pdf = find_source_pdf(layout)
+        ids_list = ids
+        sel_reg = next((r for r in regions if r["id"] == ss.sel_region), None)
 
-        with col_img:
-            pdf = find_source_pdf(layout)
-            zc1, zc2, zc3, zc4 = st.columns([1, 1, 1, 3])
-            if zc1.button("➖", help="Уменьшить"):
-                ss.zoom = max(0.5, round(ss.zoom - 0.25, 2))
-            if zc2.button("➕", help="Увеличить"):
-                ss.zoom = min(4.0, round(ss.zoom + 0.25, 2))
-            if zc3.button("↺", help="Вернуть масштаб 100%"):
-                ss.zoom = 1.0
-            zc4.caption(f"Масштаб {int(ss.zoom * 100)}%. "
-                        "Кликните по блоку на макете, чтобы открыть его текст.")
-            if pdf:
-                base = rendered_page(str(pdf), pdf.stat().st_mtime)
-                img = draw_regions(base, regions, selected_id=ss.sel_region)
-                view_w = int(900 * ss.zoom)
-                shown = img.resize((view_w,
-                                    max(1, int(img.height * view_w / img.width))),
-                                   Image.LANCZOS)
-                clicked = None
-                try:
-                    from streamlit_image_coordinates import \
-                        streamlit_image_coordinates as image_coords
-                    clicked = image_coords(shown, key="layout_click")
-                except ImportError:
-                    st.image(shown)
-                    st.caption("Для выбора блока мышью установите пакет "
-                               "streamlit-image-coordinates.")
-                if clicked:
-                    rid = region_at(regions, clicked["x"] / shown.width,
-                                    clicked["y"] / shown.height)
-                    if rid and rid != ss.sel_region:
-                        ss.sel_region = rid
+        # ── СВЕРХУ: крупный вид блока (слева) и его текст (справа) ─────────
+        # Порядок по замечанию Сергея (01.09): то, с чем работают руками —
+        # выше; общий макет для навигации — ниже.
+        top_left, top_right = st.columns([3, 2], gap="large")
+
+        with top_left:
+            if sel_reg and pdf:
+                st.markdown(f"**Блок {sel_reg['id']} крупно** "
+                            f"({sel_reg['kind']})")
+                with st.container(horizontal=True):
+                    idx = ids_list.index(sel_reg["id"])
+                    if st.button("⬅️ предыдущий", key="prev_reg",
+                                 disabled=idx == 0):
+                        ss.sel_region = ids_list[idx - 1]
+                        ss.region_pick = ss.sel_region
                         st.rerun()
-                st.caption("🟩 прочитано уверенно · 🟨 требует проверки "
-                           "человеком · 🟦 выбранный блок. "
-                           "При масштабе больше 100% страница прокручивается.")
-            else:
+                    if st.button("следующий ➡️", key="next_reg",
+                                 disabled=idx == len(ids_list) - 1):
+                        ss.sel_region = ids_list[idx + 1]
+                        ss.region_pick = ss.sel_region
+                        st.rerun()
+                    st.segmented_control("Масштаб", ZOOM_STEPS, key="zoom",
+                                         format_func=lambda z: f"{z}%",
+                                         label_visibility="collapsed")
+                zoom = ss.zoom or 100
+                crop = region_crop(str(pdf), pdf.stat().st_mtime,
+                                   json.dumps(sel_reg.get("bbox")),
+                                   int(900 * zoom / 100))
+                if crop is not None:
+                    with st.container(height=520 if zoom > 100 else "content"):
+                        st.image(crop, width=crop.width)
+                    st.caption(f"Блок {idx + 1} из {len(ids_list)}. "
+                               "Масштаб меняет размер этого фрагмента; при "
+                               "увеличении окно прокручивается.")
+                else:
+                    st.caption("У блока нет рамки — крупный вид недоступен.")
+            elif not pdf:
                 st.info("PDF макета не найден рядом — тексты блоков доступны "
                         "справа.")
 
-        with col_edit:
-            st.markdown("### Блоки макета")
+        with top_right:
+            st.markdown("### Текст блока")
             manual = [r for r in regions if r.get("status") != "прочитано"]
             if manual:
                 st.warning(f"Проверьте текст {len(manual)} блоков: "
                            + ", ".join(r["id"] for r in manual))
-            ids = [r["id"] for r in regions]
-            sel = st.selectbox(
-                "Блок", ids, index=ids.index(ss.sel_region) if ss.sel_region in ids else 0,
+
+            def _pick_changed():
+                ss.sel_region = ss.region_pick
+
+            st.selectbox(
+                "Блок", ids_list, key="region_pick", on_change=_pick_changed,
                 format_func=lambda rid: (
                     ("✏️ " if next(r for r in regions if r["id"] == rid).get("human_edited")
                      else "✅ " if next(r for r in regions if r["id"] == rid).get("status") == "прочитано"
                      else "⚠️ ") + rid + " · " +
                     next(r for r in regions if r["id"] == rid)["kind"]))
-            if sel != ss.sel_region:
-                ss.sel_region = sel
-                st.rerun()
+            sel = ss.sel_region
             region = next(r for r in regions if r["id"] == sel)
             if region.get("status_reason"):
                 st.caption(f"{region.get('status')} — {region['status_reason']}")
             new_text = st.text_area(
-                "Текст блока — исправьте ошибки распознавания",
-                value=region.get("text") or "", height=280, key=f"txt_{sel}")
+                "Исправьте ошибки распознавания",
+                value=region.get("text") or "", height=320, key=f"txt_{sel}")
             changed = new_text != (region.get("text") or "")
-            if st.button("💾 Сохранить исправление", type="primary" if changed else "secondary",
-                         disabled=not changed,
-                         help="Обычная кнопка: нажмите мышью, никаких "
-                              "сочетаний клавиш не нужно"):
+            if st.button("💾 Сохранить исправление",
+                         type="primary" if changed else "secondary",
+                         disabled=not changed):
                 apply_region_edit(layout, sel, new_text)
                 save_layout(layout, ss.layout_path)
                 ss.report = ss.plan = None
                 st.success("Исправление сохранено — проверка пойдёт по нему.")
-                time.sleep(0.8)
+                time.sleep(0.7)
                 st.rerun()
             if not changed:
-                st.caption("Текст не менялся. Если правки не нужны — переходите "
-                           "к проверке кнопкой ниже.")
+                st.caption("Текст не менялся. Если правки не нужны — "
+                           "переходите к проверке кнопкой внизу.")
+
+        # ── НИЖЕ: общий вид макета с подсветкой блоков ─────────────────────
+        if pdf:
+            st.markdown("**Весь макет** — кликните по блоку, чтобы открыть "
+                        "его крупно и поправить текст")
+            slim = json.dumps(
+                [{"id": r["id"], "kind": r["kind"], "bbox": r.get("bbox"),
+                  "status": r.get("status")} for r in regions],
+                ensure_ascii=False)
+            shown = overlay_image(str(pdf), pdf.stat().st_mtime, slim,
+                                  ss.sel_region, 900)
+            clicked, click_error = None, None
+            image_coords = load_click_component()
+            if image_coords is None:
+                click_error = ss.get("click_component_error")
+            else:
+                try:
+                    clicked = image_coords(shown, width="stretch",
+                                           key="layout_click")
+                except Exception as e:  # noqa: BLE001 — версия API могла
+                    click_error = f"{type(e).__name__}: {e}"  # измениться
+            if click_error:
+                st.image(shown, width="stretch")
+                with st.expander("⚠️ Выбор блока мышью недоступен — "
+                                 "подробности", expanded=False):
+                    st.markdown(
+                        "Компонент кликов не запустился. Блоки переключаются "
+                        "кнопками «предыдущий/следующий» и списком — работать "
+                        "можно.\n\n"
+                        f"**Причина:** `{click_error}`\n\n"
+                        f"**Python приложения:** `{sys.executable}`\n\n"
+                        "Если пакет установлен, но в причине ошибка импорта — "
+                        "установка попала в другую среду. Проверьте в "
+                        "терминале со включённым `.venv`:\n\n"
+                        "```\npython -c \"import streamlit_image_coordinates "
+                        "as m; print(m.__file__)\"\n```")
+            elif clicked:
+                # Компонент возвращает фактические размеры отображения —
+                # считаем по ним, иначе координаты «уезжают».
+                cw = clicked.get("width") or shown.width
+                ch = clicked.get("height") or shown.height
+                rid = region_at(regions, clicked["x"] / cw, clicked["y"] / ch)
+                if rid and rid != ss.sel_region:
+                    ss.sel_region = rid
+                    ss.region_pick = rid
+                    st.rerun()
+            st.caption("🟩 прочитано уверенно · 🟨 требует проверки человеком "
+                       "· 🟦 выбранный блок")
 
         st.divider()
-        st.markdown("#### Тексты проверены?")
         st.button("➡️ Перейти к шагу 2: проверка по регламентам",
-                  type="primary", key="goto_check",
-                  help="Откройте вкладку «2 · Проверка» сверху")
-        st.caption("Нажмите вкладку «2 · Проверка» вверху страницы — "
-                   "исправления уже сохранены.")
+                  type="primary", on_click=go_to, args=(STEPS[1],))
 
 
 # ═════════════════════════════ 2 · ПРОВЕРКА ══════════════════════════════════
 
-with tabs[1]:
+elif step == STEPS[1]:
     st.subheader("Шаг 2. Проверьте макет по регламентам")
     if not ss.layout:
-        st.info("Сначала откройте макет на вкладке «1 · Макет».")
+        st.info("Сначала откройте макет на шаге 1.")
+        st.button("⬅️ К шагу 1", on_click=go_to, args=(STEPS[0],))
     else:
-        st.markdown(
-            "**Выберите профильные регламенты.** Общие правила маркировки "
-            "(ТР ТС 022/2011 и др.) применяются всегда. Дополнительно "
-            "существуют регламенты для отдельных видов продукции — у них "
-            "свои требования к наименованию, составу и хранению.")
+        with st.container(border=True):
+            st.markdown("**По каким регламентам идёт проверка**")
+            st.markdown(
+                "Применяются ВСЕГДА, независимо от продукта:\n"
+                "- **ТР ТС 022/2011** — маркировка пищевой продукции "
+                "(основной: наименование, состав, сроки, пищевая ценность, "
+                "язык, шрифт)\n"
+                "- **ТР ТС 021/2011** — безопасность пищевой продукции "
+                "(условия хранения, знак обращения ЕАС)\n"
+                "- **ТР ТС 029/2012** — пищевые добавки и ароматизаторы "
+                "(классы добавок, Е-коды, предупредительные надписи)\n"
+                "- **ТР ТС 005/2011** — упаковка (знаки материала, петля "
+                "Мёбиуса, «бокал-вилка»)")
+            st.markdown(
+                "Подключаются по виду продукции — их и нужно выбрать ниже:\n"
+                "- **ТР ТС 034/2013** — мясо и мясная продукция\n"
+                "- **ТР ЕАЭС 051/2021** — мясо птицы\n"
+                "- **ТР ЕАЭС 040/2016** — рыба и морепродукты")
+        st.markdown("**Выберите профильные регламенты** — у них свои "
+                    "требования к наименованию, составу и хранению.")
         mode = st.radio(
             "Как определить профильные регламенты",
             ["Определить автоматически по названию и составу",
@@ -359,23 +579,26 @@ with tabs[1]:
              "Не применять профильные — только общие правила маркировки"],
             captions=[
                 "Система ищет в тексте макета признаки мяса, птицы или рыбы",
-                "Вы сами отмечаете, к какой продукции относится макет",
+                "Вы сами отмечаете, к какой продукции относится макет "
+                "(переключатели появятся ниже)",
                 "Подходит для овощей, фруктов, бакалеи — там профильных "
                 "регламентов нет"],
             label_visibility="collapsed")
 
         override = None
         if mode == "Указать вручную":
-            picked = []
-            cols = st.columns(len(CATEGORY_LABELS))
-            for col, (key, label) in zip(cols, CATEGORY_LABELS.items()):
-                on = col.toggle(label, key=f"cat_{key}", help=CATEGORY_HINTS[key])
-                if on:
-                    picked.append(key)
-            override = set(picked)
-            if not picked:
-                st.caption("Ни один переключатель не включён — проверка "
-                           "пойдёт только по общим правилам.")
+            with st.container(border=True):
+                st.markdown("**Отметьте виды продукции:**")
+                picked = []
+                with st.container(horizontal=True):
+                    for key, label in CATEGORY_LABELS.items():
+                        if st.toggle(label, key=f"cat_{key}",
+                                     help=CATEGORY_HINTS[key]):
+                            picked.append(key)
+                override = set(picked)
+                if not picked:
+                    st.caption("Ничего не отмечено — проверка пойдёт только "
+                               "по общим правилам маркировки.")
         elif mode.startswith("Не применять"):
             override = set()
 
@@ -383,15 +606,13 @@ with tabs[1]:
                   if r.get("status") != "прочитано"]
         if unread:
             st.warning("Блоки без выверки: " + ", ".join(unread) +
-                       ". Их текст попадёт в проверку с пометкой "
-                       "«прочитан ненадёжно» — вернитесь на шаг 1, если "
-                       "хотите поправить.")
+                       ". Их текст попадёт в проверку с пометкой «прочитан "
+                       "ненадёжно» — вернитесь на шаг 1, если хотите поправить.")
 
         st.caption("Первая проверка макета — примерно $1 и несколько минут. "
                    "Повторная проверка того же макета без исправлений "
-                   "мгновенная и бесплатная: ответы берутся из сохранённых. "
-                   "Как только вы исправите текст блока, ответы "
-                   "пересчитываются заново.")
+                   "мгновенная и бесплатная. Как только текст блока изменён, "
+                   "ответы пересчитываются заново.")
 
         if st.button("🚀 Проверить макет", type="primary"):
             status = st.status("Готовлю проверку…", expanded=True)
@@ -402,8 +623,9 @@ with tabs[1]:
                 label = st.empty()
 
                 def progress(done, total, name):
-                    bar.progress(done / total)
-                    label.write(f"Проверка {done} из {total}: **{name}**")
+                    bar.progress(min(1.0, done / total))
+                    label.write(f"Проверка {min(done + 1, total)} из {total}: "
+                                f"**{name}**")
 
                 report = check_layout(ss.layout, retriever, client, CFG,
                                       categories_override=override,
@@ -423,7 +645,9 @@ with tabs[1]:
             con = connect()
             ss.check_id = record_check(con, report, str(rpath.with_suffix(".md")))
             con.close()
-            ss.report, ss.plan, ss.saved_ids = report, plan, set()
+            ss.report, ss.plan = report, plan
+            for k in [k for k in ss if str(k).startswith(("dec_", "rate_", "note_"))]:
+                del ss[k]          # оценки прошлой проверки не переносим
             st.rerun()
 
     report = ss.report
@@ -439,19 +663,16 @@ with tabs[1]:
         c3.metric("🟢 Замечаний нет", counts[STATUS_COMPLIANT])
         c4.metric("⚪ Не относится к продукту", n_na)
         st.caption(human_summary(report["meta"]))
-        st.markdown("Разверните замечание, чтобы увидеть подробности, "
-                    "нормы регламентов и **оценить ответ системы**.")
+        st.markdown("Разверните замечание, выберите **что с ним делать** и "
+                    "при желании оцените ответ системы. Всё сохраняется само.")
 
-        con = connect()
         order = {STATUS_VIOLATION: 0, STATUS_MANUAL: 1, STATUS_COMPLIANT: 2}
         for v in sorted(report["verdicts"],
                         key=lambda v: (order[v["status"]], v["id"])):
             icon = "⚪" if not v["applicable"] else ICONS[v["status"]]
             head = ("не относится к этому продукту" if not v["applicable"]
                     else v["status"])
-            saved = v["id"] in ss.saved_ids
-            with st.expander(f"{icon} {v['id']}. {v['name']} — {head}"
-                             + ("  ✔ оценено" if saved else ""),
+            with st.expander(f"{icon} {v['id']}. {v['name']} — {head}",
                              expanded=(v["applicable"] and
                                        v["status"] == STATUS_VIOLATION)):
                 st.write(v["explanation"] or "—")
@@ -462,52 +683,25 @@ with tabs[1]:
                             f"на макете {a.get('stated_kcal', '—')} ккал / "
                             f"{a.get('stated_kj', '—')} кДж "
                             f"(расхождение {a.get('dev_kcal_pct', '—')}%).")
-                for c in v["citations"]:
-                    quote_block(c["quote"], c["address"])
-                if v.get("downgraded_reason"):
-                    st.caption(f"⚙️ Система понизила уверенность: "
-                               f"{v['downgraded_reason']}")
-
-                st.markdown("---")
-                fb1, fb2 = st.columns([1, 2])
-                rating = fb1.radio(
-                    "Оцените ответ системы",
-                    ["не оценивал", "👍 верно", "👎 система ошиблась"],
-                    key=f"rate_{v['id']}", horizontal=False,
-                    help="Оценка не меняет вердикт — это журнал качества "
-                         "системы. «Система ошиблась» убирает пункт из плана "
-                         "работ и попадает в статистику для доработки правил.")
-                if rating.startswith("👍") and v["status"] == STATUS_COMPLIANT:
-                    default_dec = "none"
-                elif rating.startswith("👎"):
-                    default_dec = "none"
-                elif v["status"] == STATUS_VIOLATION:
-                    default_dec = "designer"
-                elif v["status"] == STATUS_MANUAL:
-                    default_dec = "manual"
-                else:
-                    default_dec = "none"
-                dec_keys = list(DECISIONS)
-                decision = fb2.selectbox(
-                    "Что делать с замечанием",
-                    dec_keys, index=dec_keys.index(default_dec),
-                    key=f"dec_{v['id']}",
-                    format_func=lambda k: f"{DECISIONS[k][0]} — {DECISIONS[k][1]}")
-                note = st.text_input(
-                    "Своими словами (попадёт в план работ вместо "
-                    "формулировки системы)", key=f"note_{v['id']}",
-                    placeholder="например: заменить «Изготовлено и упаковано» "
-                                "на «Дата изготовления»")
-                if st.button("💾 Сохранить оценку", key=f"save_{v['id']}"):
-                    with st.spinner("Сохраняю…"):
-                        record_feedback(
-                            con, ss.check_id, v["id"], v["name"], v["status"],
-                            rating=("up" if rating.startswith("👍")
-                                    else "down" if rating.startswith("👎") else None),
-                            note=note, note_type=DECISIONS[decision][0])
-                        ss.saved_ids = ss.saved_ids | {v["id"]}
-                    st.success("Сохранено")
-        con.close()
+                default = ("designer" if v["status"] == STATUS_VIOLATION
+                           else "manual" if v["status"] == STATUS_MANUAL
+                           else "none")
+                if not v["applicable"]:
+                    default = "none"
+                # Решение и оценка идут СРАЗУ после вердикта (замечание
+                # Сергея 01.09): вердикт и поле «своими словами» должны быть
+                # видны на экране вместе, без прокрутки через цитаты.
+                decision_widgets(v["id"], v["name"], v["status"], default,
+                                 note_hint="например: заменить «Изготовлено и "
+                                           "упаковано» на «Дата изготовления»")
+                if v["citations"] or v.get("downgraded_reason"):
+                    with st.expander("📖 Нормы регламентов, на которые "
+                                     "опирается вердикт", expanded=False):
+                        for c in v["citations"]:
+                            quote_block(c["quote"], c["address"])
+                        if v.get("downgraded_reason"):
+                            st.caption(f"⚙️ Система понизила уверенность: "
+                                       f"{v['downgraded_reason']}")
 
         st.subheader("Прочие замечания (не требования регламентов)")
         for block in report["other_remarks"]:
@@ -515,9 +709,13 @@ with tabs[1]:
                              f"({len(block['items'])})"):
                 for item in block["items"]:
                     st.markdown(f"- {item}")
+                decision_widgets(block["id"], block["name"], "прочее замечание",
+                                 "none",
+                                 note_hint="например: исправить опечатку "
+                                           "«plaease» на «please»")
 
-        vis = report["vision"]
         with st.expander("Как система прочитала макет"):
+            vis = report["vision"]
             cov = vis["text_layer_coverage"]
             st.markdown("- Сверка с текстовым слоем PDF: " +
                         (f"{cov * 100:.0f}% текста" if isinstance(cov, (int, float))
@@ -528,30 +726,45 @@ with tabs[1]:
                 st.markdown(f"- Блок {r['id']} ({r['kind']}) прочитан "
                             f"ненадёжно: {r['reason'] or '—'}")
 
-        st.info("Оценили замечания? Откройте вкладку «3 · План работ» — "
-                "там готовый документ для дизайнера и поставщика.")
+        st.divider()
+        st.button("➡️ Готово — перейти к плану работ", type="primary",
+                  on_click=go_to, args=(STEPS[2],))
 
 
 # ═════════════════════════════ 3 · ПЛАН РАБОТ ════════════════════════════════
 
-with tabs[2]:
+else:
     st.subheader("Шаг 3. План работ")
     if not ss.report:
-        st.info("Сначала проверьте макет на вкладке «2 · Проверка».")
+        st.info("Сначала проверьте макет на шаге 2.")
+        st.button("⬅️ К шагу 2", on_click=go_to, args=(STEPS[1],))
     else:
         st.markdown("Короткие пункты без ссылок на регламенты — можно "
                     "скопировать в письмо дизайнеру или поставщику. "
-                    "Учтены ваши оценки и заметки с шага 2.")
+                    "Учтены ваши решения и заметки с шага 2.")
+
         decisions = {}
         for v in ss.report["verdicts"]:
-            rating = ss.get(f"rate_{v['id']}", "не оценивал")
+            rating = ss.get(f"rate_{v['id']}", RATINGS[0])
             decisions[v["id"]] = {
                 "rating": ("up" if str(rating).startswith("👍")
                            else "down" if str(rating).startswith("👎") else None),
                 "target": ss.get(f"dec_{v['id']}"),
-                "note": ss.get(f"note_{v['id']}", ""),
-            }
+                "note": ss.get(f"note_{v['id']}", "")}
         plan = apply_human_decisions(ss.plan or [], decisions)
+
+        # Прочие замечания (штрихкод, орфография) — попадают в план только
+        # если человек выбрал для них адресата (по умолчанию «не требуется»).
+        for block in ss.report["other_remarks"]:
+            target = ss.get(f"dec_{block['id']}", "none")
+            if target == "none":
+                continue
+            note = (ss.get(f"note_{block['id']}", "") or "").strip()
+            plan.append({"aspect_id": block["id"], "aspect_name": block["name"],
+                         "target": target,
+                         "text": note or "; ".join(block["items"][:2]),
+                         "edited_by_human": bool(note)})
+        plan.sort(key=lambda i: (list(TARGETS).index(i["target"]), i["aspect_id"]))
 
         if not plan:
             st.success("Действий не требуется — замечаний, требующих работы, "
@@ -563,31 +776,47 @@ with tabs[2]:
             st.markdown(f"### {title}")
             st.caption(hint)
             for n, item in enumerate(items, 1):
-                mark = " ✏️" if item.get("edited_by_human") else ""
-                st.markdown(f"{n}. {item['text']}{mark}  \n"
+                mark = (" <em>(ваша формулировка)</em>"
+                        if item.get("edited_by_human") else "")
+                st.markdown(f"{n}. {item['text']}  \n"
                             f"<span style='opacity:.6;font-size:.85em'>"
-                            f"проверка: {item['aspect_name']}</span>",
+                            f"проверка: {item['aspect_name']}{mark}</span>",
                             unsafe_allow_html=True)
 
         md = render_plan_markdown(plan, ss.report)
         st.markdown("#### Скопировать или скачать")
-        st.code(md, language="markdown")
-        st.caption("У блока выше справа есть кнопка копирования — "
-                   "текст копируется целиком, без горячих клавиш.")
+        # Кнопка копирования — отдельной строкой: она рисуется во встроенной
+        # рамке браузера и в одном ряду с обычными кнопками съезжает вниз
+        # (замечание Сергея 01.09).
+        copy_button(md)
         d1, d2 = st.columns(2)
         d1.download_button("⬇️ Скачать текстом (.md)", data=md,
-                           file_name="Позиции_к_доработке.md", mime="text/markdown")
+                           file_name="Позиции_к_доработке.md",
+                           mime="text/markdown", width="stretch")
         docx_path = UI_REPORTS_DIR / "plan_last.docx"
         try:
             UI_REPORTS_DIR.mkdir(parents=True, exist_ok=True)
             plan_to_docx(plan, ss.report, docx_path)
             d2.download_button(
                 "⬇️ Скачать для Word (.docx)", data=docx_path.read_bytes(),
-                file_name="Позиции_к_доработке.docx",
+                file_name="Позиции_к_доработке.docx", width="stretch",
                 mime="application/vnd.openxmlformats-officedocument."
                      "wordprocessingml.document")
         except Exception as e:  # noqa: BLE001
             d2.caption(f"Word-версия недоступна: {e}")
+        st.markdown("#### Текст плана целиком")
+        # Показываем ЦЕЛИКОМ, без внутренней прокрутки (решение Сергея):
+        # текст должен читаться и копироваться одним куском, какой бы
+        # длинный он ни был. За возврат страницы наверх при смене шага
+        # отвечает якорь верха (scroll_to_top), а не высота этого блока.
+        if True:
+            # st.code не переносит длинные строки — текст уезжал за край окна.
+            st.markdown(
+                "<div style='white-space:pre-wrap;word-break:break-word;"
+                "font-family:ui-monospace,SFMono-Regular,Menlo,monospace;"
+                "font-size:.9em;background:rgba(150,150,150,.08);"
+                "padding:12px;border-radius:.5rem;max-width:100%;'>"
+                + html.escape(md) + "</div>", unsafe_allow_html=True)
 
     st.divider()
     with st.expander("Журнал проверок (история и оценки)"):
@@ -597,10 +826,10 @@ with tabs[2]:
             st.caption("Проверок ещё не было.")
         else:
             for c in checks[:10]:
-                st.markdown(
-                    f"**#{c['id']}** · {c['ts']} · {c['source_pdf'] or '—'} — "
-                    f"🔴 {c['n_violation']} · 🟡 {c['n_manual']} · "
-                    f"🟢 {c['n_ok']} · ⚪ {c['n_na']}")
+                st.markdown(f"**#{c['id']}** · {c['ts']} · "
+                            f"{c['source_pdf'] or '—'} — "
+                            f"🔴 {c['n_violation']} · 🟡 {c['n_manual']} · "
+                            f"🟢 {c['n_ok']} · ⚪ {c['n_na']}")
             fb = fetch_feedback(con)
             if fb:
                 st.markdown(f"Оценок сохранено: **{len(fb)}** "

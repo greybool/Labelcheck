@@ -201,9 +201,13 @@ def apply_human_decisions(plan: list[dict], decisions: dict) -> list[dict]:
         if target == "none":
             continue
         note = (d.get("note") or "").strip()
+        # Разделяем два разных случая: человек ПЕРЕПИСАЛ текст пункта и
+        # человек лишь сменил адресата. В отчёте пометка «ваша формулировка»
+        # должна стоять только у переписанных (замечание Сергея 01.09).
         out.append({**item, "target": target,
                     "text": note or item["text"],
-                    "edited_by_human": bool(note) or target != item["target"]})
+                    "edited_by_human": bool(note),
+                    "moved_by_human": target != item["target"]})
     out.sort(key=lambda i: (TARGET_KEYS.index(i["target"]), i["aspect_id"]))
     return out
 

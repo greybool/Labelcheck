@@ -24,7 +24,10 @@ from pathlib import Path
 
 from labelcheck.retrieval import ROOT, load_config
 
-NOTE_TYPES = ("на перепрогон", "замечание дизайнеру", "прочее")
+# Решение по замечанию (хранится ключом — для дашборда мониторинга):
+#   none — ничего не требуется, designer — правка макета,
+#   supplier — запрос производителю, manual — проверить самому.
+NOTE_TYPES = ("none", "designer", "supplier", "manual")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS checks (
@@ -128,6 +131,31 @@ def record_feedback(con: sqlite3.Connection, check_id: int, aspect_id: int,
          rating, note.strip(), note_type))
     con.commit()
     return cur.lastrowid
+
+
+def upsert_feedback(con: sqlite3.Connection, check_id: int, aspect_id: int,
+                    aspect_name: str, verdict_status: str,
+                    rating: str | None = None, note: str = "",
+                    note_type: str | None = None) -> int:
+    """Оценка вердикта с автосохранением (UI, день 9): повторная правка того
+    же аспекта в той же проверке ЗАМЕНЯЕТ прежнюю запись, а не плодит новые.
+    Кнопки «сохранить» в интерфейсе нет — виджет меняется, запись
+    обновляется."""
+    if rating not in ("up", "down", None):
+        raise ValueError(f"rating: ожидаю up/down/None, получено {rating!r}")
+    row = con.execute(
+        "SELECT id FROM feedback WHERE check_id=? AND aspect_id=?",
+        (check_id, aspect_id)).fetchone()
+    if row is None:
+        return record_feedback(con, check_id, aspect_id, aspect_name,
+                               verdict_status, rating, note, note_type)
+    con.execute(
+        "UPDATE feedback SET ts=?, aspect_name=?, verdict_status=?, rating=?, "
+        "note=?, note_type=? WHERE id=?",
+        (_now(), aspect_name, verdict_status, rating, note.strip(), note_type,
+         row["id"]))
+    con.commit()
+    return row["id"]
 
 
 def fetch_feedback(con: sqlite3.Connection,

@@ -67,9 +67,9 @@ def test_feedback_roundtrip_and_validation():
                       rating="up")
     S.record_feedback(con, cid, 2, "Состав", "требует ручной проверки",
                       rating="down", note="запросить вид сырья",
-                      note_type="на перепрогон")
+                      note_type="supplier")
     fb = S.fetch_feedback(con, cid)
-    assert len(fb) == 2 and fb[1]["note_type"] == "на перепрогон"
+    assert len(fb) == 2 and fb[1]["note_type"] == "supplier"
     for bad in ({"rating": "meh"}, {"note_type": "не тот тип"}):
         try:
             S.record_feedback(con, cid, 1, "x", "соответствует", **bad)
@@ -85,7 +85,7 @@ def test_export_notes_only_nonempty():
     cid = S.record_check(con, REPORT)
     S.record_feedback(con, cid, 1, "a", "соответствует", rating="up")
     S.record_feedback(con, cid, 2, "b", "соответствует", note="дизайнеру: логотип",
-                      note_type="замечание дизайнеру")
+                      note_type="designer")
     notes = S.export_notes(con, cid)
     assert len(notes) == 1 and notes[0]["aspect_id"] == 2
 
@@ -138,7 +138,39 @@ def test_app_boots_headless():
     assert at.title and "LabelCheck" in at.title[0].value
     joined = " ".join(c.value for c in at.caption)
     assert "за специалистом и юристом" in joined  # дисклеймер ТЗ
-    assert len(at.tabs) == 3
+    # Навигация — состоянием, а не вкладками: кнопки «Далее» должны
+    # переключать шаг (вкладки Streamlit из кода переключить нельзя).
+    assert at.session_state["nav"] == "1 · Макет"
+
+
+def test_next_button_switches_step():
+    """Кнопка «Перейти к шагу 2» реально переводит на второй шаг."""
+    from streamlit.testing.v1 import AppTest
+    at = AppTest.from_file(str(ROOT / "labelcheck" / "app.py"), default_timeout=90)
+    at.run()
+    at.session_state["layout"] = LAYOUT
+    at.session_state["layout_path"] = "/tmp/x.json"
+    at.run()
+    nxt = [b for b in at.button if "шагу 2" in b.label]
+    assert nxt, [b.label for b in at.button]
+    nxt[0].click().run()
+    assert at.session_state["nav"] == "2 · Проверка", at.session_state["nav"]
+    assert not at.exception, at.exception
+
+
+def test_feedback_autosaves_without_button():
+    """Оценка сохраняется сама при изменении виджета — отдельной кнопки
+    «сохранить» в интерфейсе нет (замечание Сергея 31.08)."""
+    con = _con()
+    cid = S.record_check(con, REPORT)
+    S.upsert_feedback(con, cid, 1, "Наименование", "возможное нарушение",
+                      rating="up", note_type="designer")
+    S.upsert_feedback(con, cid, 1, "Наименование", "возможное нарушение",
+                      rating="down", note="ложное срабатывание",
+                      note_type="none")
+    fb = S.fetch_feedback(con, cid)
+    assert len(fb) == 1, fb                       # правка заменила запись
+    assert fb[0]["rating"] == "down" and fb[0]["note_type"] == "none"
 
 
 if __name__ == "__main__":
