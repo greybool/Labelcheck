@@ -173,6 +173,187 @@ def test_feedback_autosaves_without_button():
     assert fb[0]["rating"] == "down" and fb[0]["note_type"] == "none"
 
 
+def test_confirm_region_without_edit():
+    """R-08: человек подтверждает сомнительный блок без правки текста —
+    статус «прочитано», причина «подтверждено человеком», текст не тронут,
+    в истории — запись confirm; повтор на уже прочитанном — no-op."""
+    layout = json.loads(json.dumps(LAYOUT))
+    r = layout["regions"][0]
+    assert S.confirm_region(layout, "r1") is True
+    assert r["status"] == "прочитано" and r["status_reason"] == "подтверждено человеком"
+    assert r["text"] == "Состав: мука, вода" and r.get("human_confirmed")
+    assert r["edits"][-1]["action"] == "confirm"
+    assert r["edits"][-1]["was_status"] == "требует ручной проверки"
+    assert S.confirm_region(layout, "r1") is False
+    try:
+        S.confirm_region(layout, "нет-такого")
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("ожидали KeyError на неизвестный регион")
+
+
+def test_decisions_for_check_shape():
+    """R-04: выборка решений по проверке — словарь по aspect_id с rating /
+    note_type / note; пустой note_type читается как 'none'."""
+    con = _con()
+    cid = S.record_check(con, REPORT)
+    S.upsert_feedback(con, cid, 1, "Наименование", "возможное нарушение",
+                      rating="up", note_type="designer", note="переписать")
+    S.upsert_feedback(con, cid, 2, "Состав", "требует ручной проверки",
+                      rating=None, note_type=None)
+    d = S.decisions_for_check(con, cid)
+    assert d[1] == {"rating": "up", "note_type": "designer", "note": "переписать"}
+    assert d[2] == {"rating": None, "note_type": "none", "note": ""}
+    assert S.decisions_for_check(con, cid + 99) == {}
+
+
+# ── AppTest: интерфейс по замечаниям приёмки 02.09 ───────────────────────────
+
+UI_REPORT = {
+    "meta": {"source_pdf": "test.pdf", "source_sha256": "0" * 64,
+             "categories": {}, "category_scan": "manual",
+             "tokens": {}, "seconds": 3.0},
+    "verdicts": [
+        {"id": 1, "name": "Наименование продукции", "status": "возможное нарушение",
+         "applicable": True, "explanation": "Нет вида сырья.", "citations": []},
+        {"id": 3, "name": "Аллергены", "status": "соответствует",
+         "applicable": True, "explanation": "Указаны.", "citations": []},
+    ],
+    "other_remarks": [
+        {"id": 19, "key": "spelling", "name": "Орфография и пунктуация RU",
+         "items": ["опечатка А", "опечатка Б", "опечатка В"]},
+    ],
+    "vision": {"missing": [], "text_layer_coverage": 0.9, "manual_regions": []},
+}
+
+
+def _app_with_tmp_db():
+    """AppTest с базой во временной папке: приложение берёт connect из
+    labelcheck.store, подменяем его до запуска, чтобы тесты не писали
+    в рабочую data/labelcheck.db."""
+    from streamlit.testing.v1 import AppTest
+    tmp_db = Path(tempfile.mkdtemp()) / "ui.db"
+    real_connect = S.connect
+    S.connect = lambda path=None: real_connect(tmp_db)
+    at = AppTest.from_file(str(ROOT / "labelcheck" / "app.py"), default_timeout=90)
+    return at, tmp_db, real_connect
+
+
+def test_step2_has_no_auto_category_mode():
+    """R-05 (решение Сергея 02.09): автоопределение профильных регламентов
+    убрано — на шаге 2 нет переключателя режимов, три переключателя
+    видов продукции видны всегда, по умолчанию выключены."""
+    at, _, real_connect = _app_with_tmp_db()
+    try:
+        at.run()
+        at.session_state["layout"] = LAYOUT
+        at.session_state["layout_path"] = "/tmp/x.json"
+        at.session_state["nav"] = "2 · Проверка"
+        at.run()
+        assert not at.exception, at.exception
+        labels = " ".join(r.label for r in at.radio)
+        assert "автоматически" not in labels.lower(), labels
+        toggles = [t for t in at.toggle if str(t.key).startswith("cat_")]
+        assert len(toggles) == 3 and not any(t.value for t in toggles)
+        texts = " ".join(m.value for m in at.markdown)
+        assert "Базовые регламенты" in texts and "ТР ТС 022/2011" in texts
+    finally:
+        S.connect = real_connect
+
+
+def test_decisions_survive_step_switch():
+    """R-04 (обязательное замечание): оценка и решение, поставленные на шаге
+    2, переживают уход на шаг 1 и возврат — поднимаются из базы, куда их
+    положило автосохранение. Ключи виджетов Streamlit при этом стирает."""
+    at, tmp_db, real_connect = _app_with_tmp_db()
+    try:
+        at.run()
+        con = real_connect(tmp_db)
+        cid = S.record_check(con, UI_REPORT)
+        con.close()
+        at.session_state["layout"] = LAYOUT
+        at.session_state["layout_path"] = "/tmp/x.json"
+        at.session_state["report"] = UI_REPORT
+        at.session_state["plan"] = []
+        at.session_state["check_id"] = cid
+        at.session_state["nav"] = "2 · Проверка"
+        at.run()
+        assert not at.exception, at.exception
+        # решение «запросить у поставщика» (индекс 2) и оценка 👍 по аспекту 1
+        at.selectbox(key="dec_1").select_index(2).run()
+        at.radio(key="rate_1").set_value("👍 верно").run()
+        assert not at.exception, at.exception
+        con = real_connect(tmp_db)
+        saved = S.decisions_for_check(con, cid)
+        con.close()
+        assert saved[1]["note_type"] == "supplier" and saved[1]["rating"] == "up", saved
+        # уходим на шаг 1 — Streamlit стирает ключи невидимых виджетов
+        at.session_state["nav"] = "1 · Макет"
+        at.run()
+        assert "dec_1" not in at.session_state, "ключ должен быть стёрт — иначе тест не проверяет баг"
+        # возвращаемся — значения восстановлены из базы
+        at.session_state["nav"] = "2 · Проверка"
+        at.run()
+        assert not at.exception, at.exception
+        assert at.session_state["dec_1"] == "supplier", at.session_state["dec_1"]
+        assert at.session_state["rate_1"] == "👍 верно", at.session_state["rate_1"]
+    finally:
+        S.connect = real_connect
+
+
+def test_confirm_button_on_step1():
+    """R-08 в интерфейсе: у сомнительного блока есть кнопка «подтвердить»,
+    клик переводит его в «прочитано» и сохраняет layout."""
+    at, _, real_connect = _app_with_tmp_db()
+    try:
+        at.run()
+        lp = Path(tempfile.mkdtemp()) / "m.json"
+        lp.write_text(json.dumps(LAYOUT, ensure_ascii=False), encoding="utf-8")
+        at.session_state["layout"] = json.loads(json.dumps(LAYOUT))
+        at.session_state["layout_path"] = str(lp)
+        at.run()
+        btn = [b for b in at.button if "подтвердить" in b.label]
+        assert btn and not btn[0].disabled, [(b.label, b.disabled) for b in at.button]
+        btn[0].click().run()
+        assert not at.exception, at.exception
+        saved = json.loads(lp.read_text(encoding="utf-8"))
+        r = saved["regions"][0]
+        assert r["status"] == "прочитано" and r["status_reason"] == "подтверждено человеком"
+        # после подтверждения кнопка гаснет
+        at.run()
+        btn = [b for b in at.button if "подтвердить" in b.label]
+        assert btn and btn[0].disabled
+    finally:
+        S.connect = real_connect
+
+
+def test_plan_keeps_every_other_remark():
+    """R-06: прочие замечания (орфография) идут в план каждым пунктом, а не
+    первыми двумя; 👎 по блоку убирает их из плана."""
+    at, tmp_db, real_connect = _app_with_tmp_db()
+    try:
+        at.run()
+        con = real_connect(tmp_db)
+        cid = S.record_check(con, UI_REPORT)
+        con.close()
+        for k, v in (("layout", LAYOUT), ("layout_path", "/tmp/x.json"),
+                     ("report", UI_REPORT), ("plan", []), ("check_id", cid),
+                     ("dec_19", "designer"), ("nav", "3 · План работ")):
+            at.session_state[k] = v
+        at.run()
+        assert not at.exception, at.exception
+        page = " ".join(m.value for m in at.markdown)
+        for needle in ("опечатка А", "опечатка Б", "опечатка В"):
+            assert needle in page, needle
+        at.session_state["rate_19"] = "👎 система ошиблась"
+        at.run()
+        page = " ".join(m.value for m in at.markdown)
+        assert "опечатка А" not in page
+    finally:
+        S.connect = real_connect
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]
     failed = 0

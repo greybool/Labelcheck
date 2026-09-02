@@ -175,6 +175,20 @@ def export_notes(con: sqlite3.Connection,
             if (f.get("note") or "").strip()]
 
 
+def decisions_for_check(con: sqlite3.Connection, check_id: int) -> dict[int, dict]:
+    """Решения человека по одной проверке: {aspect_id: {rating, note_type,
+    note}} — для восстановления виджетов интерфейса (REVIEW-LOG R-04).
+
+    Streamlit стирает значения виджетов, которые не отрисовались в текущем
+    прогоне: стоило уйти на шаг 1 и вернуться — оценки на шаге 2 «исчезали»,
+    хотя автосохранение давно положило их в базу. Источник истины — база,
+    интерфейс лишь показывает её; заодно оценки переживают перезапуск."""
+    return {f["aspect_id"]: {"rating": f.get("rating"),
+                             "note_type": f.get("note_type") or "none",
+                             "note": f.get("note") or ""}
+            for f in fetch_feedback(con, check_id)}
+
+
 # ── правки layout'а человеком ────────────────────────────────────────────────
 
 def apply_region_edit(layout: dict, region_id: str, new_text: str,
@@ -194,6 +208,33 @@ def apply_region_edit(layout: dict, region_id: str, new_text: str,
         region["status"] = "прочитано"
         region["status_reason"] = "текст выверен человеком"
         region["human_edited"] = True
+        return True
+    raise KeyError(f"регион {region_id!r} не найден в layout")
+
+
+def confirm_region(layout: dict, region_id: str, editor: str = "human") -> bool:
+    """Человек подтвердил: текст блока верный, правок не нужно (REVIEW-LOG
+    R-08). Блок «требует ручной проверки» → «прочитано», причина —
+    «подтверждено человеком», в истории edits — запись без was (текст не
+    менялся). Возвращает False, если блок уже «прочитано» (подтверждать
+    нечего); KeyError — нет региона.
+
+    Зачем отдельно от apply_region_edit: сторожа слоя ошибаются (ложные
+    «выдумки» на PDF с кривыми, R-23), и у человека должен быть способ снять
+    пометку, не выдумывая правку. Для дашборда это другой сигнал:
+    «проверил, правок не потребовалось» против «пришлось править»."""
+    for region in layout.get("regions", []):
+        if region["id"] != region_id:
+            continue
+        if region.get("status") == "прочитано":
+            return False
+        region.setdefault("edits", []).append(
+            {"ts": _now(), "editor": editor, "action": "confirm",
+             "was_status": region.get("status"),
+             "was_reason": region.get("status_reason") or ""})
+        region["status"] = "прочитано"
+        region["status_reason"] = "подтверждено человеком"
+        region["human_confirmed"] = True
         return True
     raise KeyError(f"регион {region_id!r} не найден в layout")
 

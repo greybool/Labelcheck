@@ -177,6 +177,60 @@ def test_docx_written():
     assert "Запросить вид куриного сырья" in text
 
 
+def test_several_findings_per_aspect_all_kept():
+    """R-06: несколько находок в одном аспекте — несколько пунктов плана.
+    Раньше дедуп по aspect_id оставлял первый и молча терял остальные.
+    Дословный повтор одного текста — единственное, что режется."""
+    multi = {"items": [
+        {"aspect_id": 1, "target": "designer", "text": "Добавить вид мяса птицы."},
+        {"aspect_id": 1, "target": "designer", "text": "Убрать слово «натуральный»."},
+        {"aspect_id": 1, "target": "designer", "text": "Убрать слово «натуральный»."},
+        {"aspect_id": 2, "target": "supplier", "text": "Запросить вид сырья."},
+        {"aspect_id": 17, "target": "manual", "text": "Замерить шрифт."},
+    ]}
+    plan = A.build_plan(REPORT, client=FakeClient(multi), cfg=_cfg_tmp())
+    texts_1 = [i["text"] for i in plan if i["aspect_id"] == 1]
+    assert texts_1 == ["Добавить вид мяса птицы.", "Убрать слово «натуральный»."], texts_1
+    assert all(i["source"] == "llm" for i in plan)   # fallback не понадобился
+
+
+def test_explanation_not_truncated_in_prompt():
+    """R-06: объяснение уходит в модель целиком — обрезка до 900 символов
+    теряла находки из хвоста."""
+    long_tail = {**REPORT, "verdicts": [{
+        "id": 1, "name": "Наименование продукции", "status": "возможное нарушение",
+        "applicable": True,
+        "explanation": "х" * 1200 + " ХВОСТ_НАХОДКА."}]}
+    c = FakeClient(GOOD)
+    A.build_plan(long_tail, client=c, cfg=_cfg_tmp())
+    sent = c.calls[0]["messages"][1]["content"]
+    assert "ХВОСТ_НАХОДКА" in sent
+
+
+def test_human_note_collapses_aspect_to_one_item():
+    """R-06: своя формулировка человека заменяет ВСЕ пункты аспекта одним;
+    👎 убирает все пункты аспекта."""
+    plan = [
+        {"aspect_id": 1, "aspect_name": "Наименование", "target": "designer",
+         "text": "пункт А", "source": "llm"},
+        {"aspect_id": 1, "aspect_name": "Наименование", "target": "designer",
+         "text": "пункт Б", "source": "llm"},
+        {"aspect_id": 2, "aspect_name": "Состав", "target": "supplier",
+         "text": "пункт В", "source": "llm"},
+        {"aspect_id": 2, "aspect_name": "Состав", "target": "supplier",
+         "text": "пункт Г", "source": "llm"},
+    ]
+    out = A.apply_human_decisions(plan, {
+        1: {"rating": "up", "note": "Переписать наименование целиком"},
+        2: {"rating": "down"},
+    })
+    assert [i["text"] for i in out] == ["Переписать наименование целиком"], out
+    assert out[0]["edited_by_human"]
+    # без заметки — все пункты обоих аспектов остаются
+    out2 = A.apply_human_decisions(plan, {1: {"rating": "up"}, 2: {"rating": "up"}})
+    assert [i["text"] for i in out2] == ["пункт А", "пункт Б", "пункт В", "пункт Г"]
+
+
 def test_empty_plan_when_nothing_to_do():
     """Нет нарушений и ручных проверок — план пуст, документ это говорит."""
     clean = {"meta": {"source_pdf": "clean.pdf"},

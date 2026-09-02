@@ -30,7 +30,8 @@ from PIL import Image, ImageDraw, ImageFont
 from labelcheck.actions import (TARGETS, apply_human_decisions, build_plan,
                                 plan_to_docx, render_plan_markdown)
 from labelcheck.retrieval import ROOT, Retriever, load_config
-from labelcheck.store import (apply_region_edit, connect, fetch_checks,
+from labelcheck.store import (apply_region_edit, confirm_region, connect,
+                              decisions_for_check, fetch_checks,
                               fetch_feedback, record_check, save_layout,
                               upsert_feedback)
 from labelcheck.verdict import (STATUS_COMPLIANT, STATUS_MANUAL,
@@ -258,17 +259,19 @@ def copy_button(text: str, label: str = "📋 Скопировать текст"
 
 
 def human_summary(meta: dict) -> str:
+    """Сводка прогона человеческими словами. Профильные регламенты в
+    интерфейсе выбирает только человек (решение Сергея 02.09, R-05) —
+    автоопределение в тексте не упоминается; старые отчёты со scan
+    targeted/full описываются нейтрально."""
     cats = meta.get("categories") or {}
     if cats:
         names = ", ".join(CATEGORY_LABELS.get(c, c).split(" ", 1)[-1] for c in cats)
-        scan = {"targeted": "определено автоматически по названию и составу",
-                "full": "определено автоматически по всему макету",
-                "manual": "указано вручную"}.get(meta.get("category_scan"), "")
+        scan = ("выбраны вручную" if meta.get("category_scan") == "manual"
+                else "по маркерам в тексте — старый режим")
         cat_txt = f"Профильные регламенты: {names} ({scan})"
     else:
-        cat_txt = ("Профильные регламенты не применялись: мясо, птица и рыба "
-                   "в продукте не обнаружены — проверка по общим правилам "
-                   "маркировки")
+        cat_txt = ("Профильные регламенты не подключались — проверка по общим "
+                   "правилам маркировки (022, 021, 029, 005)")
     sec = meta.get("seconds") or 0
     dur = (f"{int(sec // 60)} мин {int(sec % 60)} с" if sec >= 60 else f"{int(sec)} с")
     return f"{cat_txt}. Проверка заняла {dur}."
@@ -293,29 +296,75 @@ def save_decision(aspect_id: int, aspect_name: str, status: str):
     (кнопок «сохранить» в интерфейсе нет — замечание Сергея 31.08)."""
     if not ss.check_id:
         return
-    rating = ss.get(f"rate_{aspect_id}", RATINGS[0])
     con = connect()
     try:
         upsert_feedback(
             con, ss.check_id, aspect_id, aspect_name, status,
-            rating=("up" if str(rating).startswith("👍")
-                    else "down" if str(rating).startswith("👎") else None),
+            rating=rating_key(ss.get(f"rate_{aspect_id}", RATINGS[0])),
             note=ss.get(f"note_{aspect_id}", ""),
             note_type=ss.get(f"dec_{aspect_id}", "none"))
     finally:
         con.close()
 
 
+def rating_label(rating: str | None) -> str:
+    """Ключ базы ('up'/'down'/None) → подпись переключателя оценки."""
+    return (RATINGS[1] if rating == "up"
+            else RATINGS[2] if rating == "down" else RATINGS[0])
+
+
+def rating_key(label) -> str | None:
+    """Подпись переключателя → ключ базы."""
+    s = str(label)
+    return "up" if s.startswith("👍") else "down" if s.startswith("👎") else None
+
+
+def restore_decisions(report: dict):
+    """Поднять решения человека из базы в состояние виджетов (R-04).
+
+    Streamlit удаляет из session_state значения виджетов, которые не
+    отрисовались в текущем прогоне: ушёл на шаг 1 — ключи dec_/rate_/note_
+    стёрты, вернулся на шаг 2 — виджеты показывают значения по умолчанию,
+    а шаг 3 строит план так, будто решений не было. Автосохранение при этом
+    писало всё в базу. Правило: перед отрисовкой шага 2 или 3 всё, чего нет
+    в состоянии, берётся из базы; чего нет и в базе — остаётся по
+    умолчанию. Ключ ставится ДО создания виджета — тогда Streamlit берёт
+    его как текущее значение без предупреждений."""
+    if not ss.check_id or not report:
+        return
+    con = connect()
+    try:
+        saved = decisions_for_check(con, ss.check_id)
+    finally:
+        con.close()
+    ids = ([v["id"] for v in report.get("verdicts", [])]
+           + [b["id"] for b in report.get("other_remarks", [])])
+    for aid in ids:
+        d = saved.get(aid)
+        if not d:
+            continue
+        ss.setdefault(f"dec_{aid}", d["note_type"] if d["note_type"] in DECISIONS
+                      else "none")
+        ss.setdefault(f"rate_{aid}", rating_label(d["rating"]))
+        ss.setdefault(f"note_{aid}", d["note"])
+
+
 def decision_widgets(aspect_id: int, aspect_name: str, status: str,
                      default_decision: str, note_hint: str = ""):
     """Решение (слева, главное) и оценка ответа системы (справа) с
-    автосохранением. Порядок по замечанию Сергея: сначала «что делать»."""
+    автосохранением. Порядок по замечанию Сергея: сначала «что делать».
+
+    Значение по умолчанию кладётся в session_state до создания виджета (а не
+    через index=/value=), чтобы восстановленные из базы значения (R-04) и
+    значения по умолчанию шли одним путём."""
     st.markdown("---")
     left, right = st.columns([2, 1])
     keys = list(DECISIONS)
+    ss.setdefault(f"dec_{aspect_id}", default_decision)
+    ss.setdefault(f"rate_{aspect_id}", RATINGS[0])
+    ss.setdefault(f"note_{aspect_id}", "")
     left.selectbox(
         "Что делать с замечанием", keys,
-        index=keys.index(ss.get(f"dec_{aspect_id}", default_decision)),
         key=f"dec_{aspect_id}",
         format_func=lambda k: f"{DECISIONS[k][0]} — {DECISIONS[k][1]}",
         on_change=save_decision, args=(aspect_id, aspect_name, status))
@@ -478,18 +527,37 @@ if step == STEPS[0]:
                 "Исправьте ошибки распознавания",
                 value=region.get("text") or "", height=320, key=f"txt_{sel}")
             changed = new_text != (region.get("text") or "")
-            if st.button("💾 Сохранить исправление",
-                         type="primary" if changed else "secondary",
-                         disabled=not changed):
+            unsure = region.get("status") != "прочитано"
+            b_save, b_ok = st.columns(2)
+            if b_save.button("💾 Сохранить исправление",
+                             type="primary" if changed else "secondary",
+                             disabled=not changed, width="stretch"):
                 apply_region_edit(layout, sel, new_text)
                 save_layout(layout, ss.layout_path)
                 ss.report = ss.plan = None
                 st.success("Исправление сохранено — проверка пойдёт по нему.")
                 time.sleep(0.7)
                 st.rerun()
+            # Подтверждение без правки (R-08): сторожа слоя ошибаются, и у
+            # человека должен быть способ снять пометку «требует проверки»,
+            # не выдумывая правку текста.
+            if b_ok.button("✅ Текст верный — подтвердить",
+                           type="primary" if (unsure and not changed) else "secondary",
+                           disabled=not unsure or changed, width="stretch",
+                           help="Блок помечен сомнительным, но текст верный: "
+                                "снять пометку. Активно только для блоков "
+                                "«требует ручной проверки» и без несохранённых "
+                                "правок."):
+                confirm_region(layout, sel)
+                save_layout(layout, ss.layout_path)
+                st.success("Блок подтверждён.")
+                time.sleep(0.5)
+                st.rerun()
             if not changed:
-                st.caption("Текст не менялся. Если правки не нужны — "
-                           "переходите к проверке кнопкой внизу.")
+                st.caption("Текст не менялся. " +
+                           ("Если он верный — подтвердите блок; " if unsure else
+                            "Если правки не нужны — ") +
+                           "к проверке — кнопкой внизу.")
 
         # ── НИЖЕ: общий вид макета с подсветкой блоков ─────────────────────
         if pdf:
@@ -527,15 +595,24 @@ if step == STEPS[0]:
                         "```\npython -c \"import streamlit_image_coordinates "
                         "as m; print(m.__file__)\"\n```")
             elif clicked:
-                # Компонент возвращает фактические размеры отображения —
-                # считаем по ним, иначе координаты «уезжают».
-                cw = clicked.get("width") or shown.width
-                ch = clicked.get("height") or shown.height
-                rid = region_at(regions, clicked["x"] / cw, clicked["y"] / ch)
-                if rid and rid != ss.sel_region:
-                    ss.sel_region = rid
-                    ss.region_pick = rid
-                    st.rerun()
+                # Компонент хранит ПОСЛЕДНИЙ клик и отдаёт его при каждой
+                # перерисовке. Без памяти об обработанном клике старый клик
+                # переигрывал кнопки «предыдущий/следующий» и откатывал выбор
+                # на блок, по которому кликали раньше (R-03). Реагируем
+                # только на клик, которого ещё не видели.
+                click_sig = (clicked.get("x"), clicked.get("y"),
+                             clicked.get("width"), clicked.get("height"))
+                if click_sig != ss.get("last_click"):
+                    ss.last_click = click_sig
+                    # Компонент возвращает фактические размеры отображения —
+                    # считаем по ним, иначе координаты «уезжают».
+                    cw = clicked.get("width") or shown.width
+                    ch = clicked.get("height") or shown.height
+                    rid = region_at(regions, clicked["x"] / cw, clicked["y"] / ch)
+                    if rid and rid != ss.sel_region:
+                        ss.sel_region = rid
+                        ss.region_pick = rid
+                        st.rerun()
             st.caption("🟩 прочитано уверенно · 🟨 требует проверки человеком "
                        "· 🟦 выбранный блок")
 
@@ -552,10 +629,15 @@ elif step == STEPS[1]:
         st.info("Сначала откройте макет на шаге 1.")
         st.button("⬅️ К шагу 1", on_click=go_to, args=(STEPS[0],))
     else:
+        # Профильные регламенты выбирает только человек (решение Сергея
+        # 02.09, R-05): автоопределение по словам-маркерам убрано из
+        # интерфейса — по упаковке вид продукции однозначно не определяется
+        # («подавайте с мясом» в рекомендациях включало ТР на мясо). По
+        # умолчанию — только базовые регламенты, переключатели видны всегда.
         with st.container(border=True):
-            st.markdown("**По каким регламентам идёт проверка**")
+            st.markdown("**Базовые регламенты — применяются всегда, "
+                        "независимо от продукта:**")
             st.markdown(
-                "Применяются ВСЕГДА, независимо от продукта:\n"
                 "- **ТР ТС 022/2011** — маркировка пищевой продукции "
                 "(основной: наименование, состав, сроки, пищевая ценность, "
                 "язык, шрифт)\n"
@@ -565,42 +647,24 @@ elif step == STEPS[1]:
                 "(классы добавок, Е-коды, предупредительные надписи)\n"
                 "- **ТР ТС 005/2011** — упаковка (знаки материала, петля "
                 "Мёбиуса, «бокал-вилка»)")
-            st.markdown(
-                "Подключаются по виду продукции — их и нужно выбрать ниже:\n"
-                "- **ТР ТС 034/2013** — мясо и мясная продукция\n"
-                "- **ТР ЕАЭС 051/2021** — мясо птицы\n"
-                "- **ТР ЕАЭС 040/2016** — рыба и морепродукты")
-        st.markdown("**Выберите профильные регламенты** — у них свои "
+        with st.container(border=True):
+            st.markdown("**Профильные регламенты — подключите, если продукт "
+                        "к ним относится:**")
+            picked = []
+            with st.container(horizontal=True):
+                for key, label in CATEGORY_LABELS.items():
+                    if st.toggle(label, key=f"cat_{key}",
+                                 help=CATEGORY_HINTS[key]):
+                        picked.append(key)
+            override = set(picked)
+            if picked:
+                st.caption("Подключены: " + "; ".join(
+                    CATEGORY_HINTS[k] for k in picked) + ". У них свои "
                     "требования к наименованию, составу и хранению.")
-        mode = st.radio(
-            "Как определить профильные регламенты",
-            ["Определить автоматически по названию и составу",
-             "Указать вручную",
-             "Не применять профильные — только общие правила маркировки"],
-            captions=[
-                "Система ищет в тексте макета признаки мяса, птицы или рыбы",
-                "Вы сами отмечаете, к какой продукции относится макет "
-                "(переключатели появятся ниже)",
-                "Подходит для овощей, фруктов, бакалеи — там профильных "
-                "регламентов нет"],
-            label_visibility="collapsed")
-
-        override = None
-        if mode == "Указать вручную":
-            with st.container(border=True):
-                st.markdown("**Отметьте виды продукции:**")
-                picked = []
-                with st.container(horizontal=True):
-                    for key, label in CATEGORY_LABELS.items():
-                        if st.toggle(label, key=f"cat_{key}",
-                                     help=CATEGORY_HINTS[key]):
-                            picked.append(key)
-                override = set(picked)
-                if not picked:
-                    st.caption("Ничего не отмечено — проверка пойдёт только "
-                               "по общим правилам маркировки.")
-        elif mode.startswith("Не применять"):
-            override = set()
+            else:
+                st.caption("Ничего не отмечено — проверка только по базовым "
+                           "регламентам. Так и нужно для овощей, фруктов, ягод, "
+                           "бакалеи: профильных регламентов для них нет.")
 
         unread = [r["id"] for r in ss.layout.get("regions", [])
                   if r.get("status") != "прочитано"]
@@ -652,6 +716,7 @@ elif step == STEPS[1]:
 
     report = ss.report
     if report:
+        restore_decisions(report)   # R-04: решения из базы — до виджетов
         st.divider()
         counts = {s: sum(1 for v in report["verdicts"]
                          if v["status"] == s and v["applicable"])
@@ -743,27 +808,30 @@ else:
                     "скопировать в письмо дизайнеру или поставщику. "
                     "Учтены ваши решения и заметки с шага 2.")
 
+        restore_decisions(ss.report)   # R-04: после захода на шаг 1 ключи стёрты
         decisions = {}
         for v in ss.report["verdicts"]:
-            rating = ss.get(f"rate_{v['id']}", RATINGS[0])
             decisions[v["id"]] = {
-                "rating": ("up" if str(rating).startswith("👍")
-                           else "down" if str(rating).startswith("👎") else None),
+                "rating": rating_key(ss.get(f"rate_{v['id']}", RATINGS[0])),
                 "target": ss.get(f"dec_{v['id']}"),
                 "note": ss.get(f"note_{v['id']}", "")}
         plan = apply_human_decisions(ss.plan or [], decisions)
 
         # Прочие замечания (штрихкод, орфография) — попадают в план только
         # если человек выбрал для них адресата (по умолчанию «не требуется»).
+        # Каждая находка — отдельным пунктом: раньше в план шли первые две
+        # из N и остальные пропадали (R-06). Своя формулировка человека
+        # заменяет весь список одним пунктом.
         for block in ss.report["other_remarks"]:
             target = ss.get(f"dec_{block['id']}", "none")
-            if target == "none":
+            if target == "none" or ss.get(f"rate_{block['id']}") == RATINGS[2]:
                 continue
             note = (ss.get(f"note_{block['id']}", "") or "").strip()
-            plan.append({"aspect_id": block["id"], "aspect_name": block["name"],
-                         "target": target,
-                         "text": note or "; ".join(block["items"][:2]),
-                         "edited_by_human": bool(note)})
+            texts = [note] if note else list(block["items"])
+            for text in texts:
+                plan.append({"aspect_id": block["id"],
+                             "aspect_name": block["name"], "target": target,
+                             "text": text, "edited_by_human": bool(note)})
         plan.sort(key=lambda i: (list(TARGETS).index(i["target"]), i["aspect_id"]))
 
         if not plan:

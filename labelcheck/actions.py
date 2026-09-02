@@ -53,8 +53,11 @@ SYSTEM_PROMPT = """Ты — помощник специалиста по зак�
             "text": "<одно предложение: что сделать>"}]}
 
 Правила:
-1. Одно замечание — один пункт. Пиши по делу: что именно не так и что
-   сделать. Максимум 20 слов на пункт.
+1. Одна находка — один пункт. Если в объяснении по аспекту несколько
+   разных находок (например, три разных надписи, две разные ошибки) —
+   дай несколько пунктов с тем же aspect_id, по одному на находку. Не
+   объединяй разные находки в один пункт и не теряй ни одной. Пиши по делу:
+   что именно не так и что сделать. Максимум 25 слов на пункт.
 2. НЕ цитируй регламенты, не указывай номера пунктов, статей и приложений,
    не пиши «согласно ТР ТС». Пункт читает дизайнер или менеджер, а не юрист.
 3. Выбирай адресата по смыслу:
@@ -119,9 +122,12 @@ def build_plan(report: dict, client=None, cfg: dict | None = None,
     if not verdicts:
         return []
     names = {v["id"]: v["name"] for v in verdicts}
+    # Объяснение целиком: обрезка до 900 символов теряла находки из хвоста
+    # (REVIEW-LOG R-06). Объяснения — 1–3 абзаца, вход дешёвой модели это
+    # выдерживает с большим запасом.
     payload = json.dumps(
         [{"aspect_id": v["id"], "аспект": v["name"], "статус": v["status"],
-          "что нашли": (v.get("explanation") or "")[:900]} for v in verdicts],
+          "что нашли": v.get("explanation") or ""} for v in verdicts],
         ensure_ascii=False, indent=1)
 
     if client is None:
@@ -156,6 +162,7 @@ def build_plan(report: dict, client=None, cfg: dict | None = None,
 
     items = []
     seen = set()
+    seen_texts = set()
     for it in (raw.get("items") or []):
         if not isinstance(it, dict):
             continue
@@ -163,15 +170,19 @@ def build_plan(report: dict, client=None, cfg: dict | None = None,
             aid = int(it.get("aspect_id"))
         except (TypeError, ValueError):
             continue
-        if aid not in names or aid in seen:
+        if aid not in names:
             continue
         text = (it.get("text") or "").strip()
-        if not text:
+        # Несколько пунктов на аспект — норма (REVIEW-LOG R-06: раньше дедуп
+        # по aspect_id оставлял один и терял остальные находки). Режем только
+        # дословные повторы одного и того же текста.
+        if not text or (aid, text.lower()) in seen_texts:
             continue
         target = it.get("target")
         if target not in TARGET_KEYS:
             target = _default_target(next(v for v in verdicts if v["id"] == aid))
         seen.add(aid)
+        seen_texts.add((aid, text.lower()))
         items.append({"aspect_id": aid, "aspect_name": names[aid],
                       "target": target, "text": text, "source": "llm"})
 
@@ -191,8 +202,11 @@ def apply_human_decisions(plan: list[dict], decisions: dict) -> list[dict]:
 
     decisions: {aspect_id: {"rating": "up"/"down"/None, "target": ключ или
     "none", "note": текст}}. «down» (система ошиблась) или target «none»
-    убирают пункт из плана; заметка человека заменяет формулировку."""
+    убирают ВСЕ пункты аспекта из плана; заметка человека заменяет их
+    ОДНИМ пунктом со своей формулировкой (у аспекта может быть несколько
+    пунктов — R-06; человек пишет одну фразу за весь аспект)."""
     out = []
+    noted = set()   # аспекты, где уже стоит пункт с формулировкой человека
     for item in plan:
         d = decisions.get(item["aspect_id"]) or {}
         if d.get("rating") == "down":
@@ -201,6 +215,10 @@ def apply_human_decisions(plan: list[dict], decisions: dict) -> list[dict]:
         if target == "none":
             continue
         note = (d.get("note") or "").strip()
+        if note:
+            if item["aspect_id"] in noted:
+                continue
+            noted.add(item["aspect_id"])
         # Разделяем два разных случая: человек ПЕРЕПИСАЛ текст пункта и
         # человек лишь сменил адресата. В отчёте пометка «ваша формулировка»
         # должна стоять только у переписанных (замечание Сергея 01.09).
