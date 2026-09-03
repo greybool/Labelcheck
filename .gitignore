@@ -56,3 +56,7 @@ data/vision_gt/
 # Прогоны vision новой схемы (приёмка) — тексты макетов, не в git
 data/layouts_v2/
 data/layouts_v3/
+
+# Личный список подстрок (бренды, города), которых не должно быть в демо-БД —
+# проверяется tests/test_dashboard.py, если файл есть на машине
+data/demo_forbidden.txt

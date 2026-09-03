@@ -8,6 +8,11 @@
 Таблицы:
 - checks   — журнал прогонов вердиктов: макет, категории, счётчики
              статусов, расход токенов, путь к отчёту;
+- verdicts — статус КАЖДОГО аспекта в прогоне (без текстов: только статус,
+             применимость, число цитат, понижение, голоса). Нужна дашборду
+             Дня 10 для разбивки «какие аспекты чаще уходят в нарушение /
+             ручную проверку» — в checks лежат только суммы по прогону, а
+             отчёты-JSON с текстами макетов в репозиторий не попадают;
 - feedback — оценка вердикта человеком (up/down) и заметка с типом
              («на перепрогон» / «замечание дизайнеру» / «прочее»).
 
@@ -44,6 +49,16 @@ CREATE TABLE IF NOT EXISTS checks (
   tokens_json   TEXT,   -- расход по моделям (JSON)
   seconds       REAL,
   report_path   TEXT
+);
+CREATE TABLE IF NOT EXISTS verdicts (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  check_id      INTEGER REFERENCES checks(id),
+  aspect_id     INTEGER,
+  status        TEXT,
+  applicable    INTEGER,  -- 1/0
+  n_citations   INTEGER,
+  downgraded    INTEGER,  -- 1, если валидатор понизил статус
+  votes         TEXT      -- JSON-список статусов голосов / NULL
 );
 CREATE TABLE IF NOT EXISTS feedback (
   id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -103,13 +118,56 @@ def record_check(con: sqlite3.Connection, report: dict,
          statuses["соответствует"], n_na,
          json.dumps(m.get("tokens", {}), ensure_ascii=False),
          m.get("seconds"), str(report_path)))
+    check_id = cur.lastrowid
+    _insert_verdicts(con, check_id, report["verdicts"])
     con.commit()
-    return cur.lastrowid
+    return check_id
+
+
+def _insert_verdicts(con: sqlite3.Connection, check_id: int,
+                     verdicts: list[dict]) -> None:
+    """Строки verdicts по одному прогону — одна на аспект, без текстов."""
+    con.executemany(
+        "INSERT INTO verdicts (check_id, aspect_id, status, applicable, "
+        "n_citations, downgraded, votes) VALUES (?,?,?,?,?,?,?)",
+        [(check_id, int(v["id"]), v["status"], 1 if v["applicable"] else 0,
+          len(v.get("citations") or []), 1 if v.get("downgraded_reason") else 0,
+          json.dumps(v["votes"], ensure_ascii=False) if v.get("votes") else None)
+         for v in verdicts])
+
+
+def backfill_verdicts(con: sqlite3.Connection, reports_dir: str | Path) -> dict:
+    """Досыпать verdicts для прогонов, записанных ДО появления таблицы
+    (сентябрь 2026): отчёт-JSON ищется в reports_dir по имени файла из
+    checks.report_path (сам путь там абсолютный и с другой машины может не
+    совпадать — берём только имя). Идемпотентно: прогон с уже записанными
+    вердиктами пропускается. Возвращает {"filled": [...ids], "missing": [...ids]}."""
+    reports_dir = Path(reports_dir)
+    done = {r[0] for r in con.execute("SELECT DISTINCT check_id FROM verdicts")}
+    filled, missing = [], []
+    for row in con.execute("SELECT id, report_path FROM checks ORDER BY id"):
+        if row["id"] in done:
+            continue
+        name = Path(row["report_path"] or "").name
+        path = reports_dir / Path(name).with_suffix(".json") if name else None
+        if not path or not path.exists():
+            missing.append(row["id"])
+            continue
+        report = json.loads(path.read_text(encoding="utf-8"))
+        _insert_verdicts(con, row["id"], report["verdicts"])
+        filled.append(row["id"])
+    con.commit()
+    return {"filled": filled, "missing": missing}
 
 
 def fetch_checks(con: sqlite3.Connection, limit: int = 50) -> list[dict]:
     rows = con.execute("SELECT * FROM checks ORDER BY id DESC LIMIT ?",
                        (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def fetch_verdicts(con: sqlite3.Connection) -> list[dict]:
+    rows = con.execute("SELECT * FROM verdicts ORDER BY check_id, aspect_id").fetchall()
     return [dict(r) for r in rows]
 
 

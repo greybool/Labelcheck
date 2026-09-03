@@ -12,6 +12,8 @@
    сохраняются САМИ (кнопок «сохранить» нет).
 3. «План работ» — короткие списки без цитат регламентов: дизайнеру,
    поставщику, проверить самому; копирование и выгрузка в Markdown/Word.
+4. «Мониторинг» — графики по журналу проверок и оценкам (День 10;
+   данные — labelcheck/dashboard.py, графики — labelcheck/dashboard_ui.py).
 """
 
 import html
@@ -29,6 +31,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from labelcheck.actions import (TARGETS, apply_human_decisions, build_plan,
                                 plan_to_docx, render_plan_markdown)
+from labelcheck import dashboard_ui
 from labelcheck.retrieval import ROOT, Retriever, load_config
 from labelcheck.store import (apply_region_edit, confirm_region, connect,
                               decisions_for_check, fetch_checks,
@@ -48,7 +51,7 @@ UI_REPORTS_DIR = ROOT / CFG["ui"]["reports_dir"]
 ICONS = {STATUS_VIOLATION: "🔴", STATUS_MANUAL: "🟡", STATUS_COMPLIANT: "🟢"}
 REGION_COLORS = {"прочитано": (46, 160, 67), "требует ручной проверки": (219, 154, 4)}
 
-STEPS = ["1 · Макет", "2 · Проверка", "3 · План работ"]
+STEPS = ["1 · Макет", "2 · Проверка", "3 · План работ", "4 · Мониторинг"]
 ZOOM_STEPS = [50, 75, 100, 150, 200, 300]
 
 CATEGORY_LABELS = {"meat": "🥩 Мясная продукция",
@@ -798,7 +801,7 @@ elif step == STEPS[1]:
 
 # ═════════════════════════════ 3 · ПЛАН РАБОТ ════════════════════════════════
 
-else:
+elif step == STEPS[2]:
     st.subheader("Шаг 3. План работ")
     if not ss.report:
         st.info("Сначала проверьте макет на шаге 2.")
@@ -908,3 +911,15 @@ else:
                     data=json.dumps(fb, ensure_ascii=False, indent=1),
                     file_name="labelcheck_feedback.json", mime="application/json")
         con.close()
+
+
+# ═════════════════════════════ 4 · МОНИТОРИНГ ════════════════════════════════
+
+else:
+    # Имя MAIN-модели из .env нужно, чтобы отличить полный прогон от повтора
+    # из кэша (по числу вызовов); без .env берётся модель с наибольшим
+    # расходом токенов.
+    import os
+    from dotenv import load_dotenv
+    load_dotenv(ROOT / ".env")
+    dashboard_ui.render(CFG, LAYOUTS_DIR, os.environ.get("MAIN_MODEL"))
