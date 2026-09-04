@@ -64,3 +64,6 @@ data/demo_forbidden.txt
 # Скиллы Streamlit для агентов (команда `streamlit skills`) — локальная утилита, не проект
 .agents/
 .claude/
+
+# Локальная корзина для переносов между сессиями — никогда не в репозиторий
+_to_delete/
