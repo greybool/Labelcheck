@@ -60,3 +60,7 @@ data/layouts_v3/
 # Личный список подстрок (бренды, города), которых не должно быть в демо-БД —
 # проверяется tests/test_dashboard.py, если файл есть на машине
 data/demo_forbidden.txt
+
+# Скиллы Streamlit для агентов (команда `streamlit skills`) — локальная утилита, не проект
+.agents/
+.claude/

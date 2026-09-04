@@ -123,13 +123,19 @@ def overlay_image(pdf_path: str, mtime: float, regions_key: str,
 def region_crop(pdf_path: str, mtime: float, bbox_json: str, width: int):
     """Увеличенный фрагмент вокруг выбранного блока (решение Сергея вместо
     перетаскивания мышью: практическая задача — рассмотреть мелкий текст).
-    Паддинг 3% стороны, чтобы блок не упирался в край."""
+    Запас вокруг рамки — доля стороны страницы плюс доля размера самого
+    блока (config → ui.crop_pad_page_pct / crop_pad_block_pct): рамки
+    обзора гуляют на 2–4% страницы, и у макетов без текстового слоя
+    (Roti, R-35) их нечем прищёлкнуть — блок показывался обрезанным."""
     bbox = json.loads(bbox_json)
     if not bbox:
         return None
     base = rendered_page(pdf_path, mtime)
     w, h = base.size
-    pad_x, pad_y = 0.03 * w, 0.03 * h
+    pp = CFG["ui"].get("crop_pad_page_pct", 4) / 100.0
+    pb = CFG["ui"].get("crop_pad_block_pct", 10) / 100.0
+    pad_x = pp * w + pb * (bbox[2] - bbox[0]) * w
+    pad_y = pp * h + pb * (bbox[3] - bbox[1]) * h
     box = (max(0, bbox[0] * w - pad_x), max(0, bbox[1] * h - pad_y),
            min(w, bbox[2] * w + pad_x), min(h, bbox[3] * h + pad_y))
     crop = base.crop(tuple(int(v) for v in box))
@@ -259,6 +265,43 @@ def copy_button(text: str, label: str = "📋 Скопировать текст"
         }};
         </script>
         """, height=52)
+
+
+def layer_diff_table(region: dict) -> None:
+    """Полная сверка блока с текстовым слоем PDF (REVIEW-LOG R-12): подмены
+    слов, слова слоя, которых нет в прочитанном тексте, и слова прочитанного
+    текста, которых нет в слое. Раньше в подписи блока показывались 8 слов
+    из ~50 — человек не мог понять, что именно расходится."""
+    pairs = region.get("word_substitutions") or []
+    missing = region.get("layer_missing_words") or []
+    paired_layer = {p["layer"] for p in pairs}
+    paired_vision = {p["vision"] for p in pairs}
+    invented = [w for w in (region.get("invented_words") or []) if w not in paired_vision]
+    digits = region.get("invented_digits") or []
+    missing = [w for w in missing if w not in paired_layer]
+    if not (pairs or missing or invented or digits):
+        if region.get("has_layer"):
+            st.caption("Сверка с текстовым слоем: расхождений нет.")
+        return
+    total = len(pairs) + len(missing) + len(invented) + len(digits)
+    with st.expander(f"Сверка с текстовым слоем PDF — расхождений: {total}",
+                     expanded=True):
+        if pairs:
+            st.markdown("**Возможные подмены слов** — vision прочитал не то, "
+                        "что напечатано; проверьте макет:")
+            st.table([{"на макете (слой PDF)": p["layer"], "прочитано": p["vision"],
+                       "тип": ("латиница вместо кириллицы" if p["kind"] == "homoglyph"
+                               else "другое слово")} for p in pairs])
+        if region.get("layer_partial"):
+            st.caption("Блок частично в кривых: слова «в слое нет» здесь — скорее "
+                       "всего, текст в кривых, а не выдумка.")
+        c1, c2 = st.columns(2)
+        c1.markdown(f"**В текстовом слое PDF есть, но при распознавании макета "
+                    f"не прочитано ({len(missing)})**")
+        c1.markdown(", ".join(missing) if missing else "—")
+        c2.markdown(f"**Прочитано при распознавании, но в текстовом слое PDF "
+                    f"нет ({len(invented) + len(digits)})**")
+        c2.markdown(", ".join(invented + digits) if (invented or digits) else "—")
 
 
 def human_summary(meta: dict) -> str:
@@ -430,7 +473,19 @@ if step == STEPS[0]:
         if not files:
             st.info("Распознанных макетов пока нет — загрузите PDF.")
         else:
-            pick = st.selectbox("Макет", files, format_func=lambda p: p.stem)
+            def _layout_label(path: Path) -> str:
+                # Двух layout'ов одного PDF в списке не отличить по имени файла
+                # (R-40: канонический gyoza.json и копия по имени PDF) —
+                # показываем исходный PDF и дату файла.
+                try:
+                    meta = json.loads(path.read_text(encoding="utf-8")).get("meta", {})
+                except (OSError, json.JSONDecodeError):
+                    meta = {}
+                src = meta.get("source_pdf") or "?"
+                when = time.strftime("%d.%m %H:%M", time.localtime(path.stat().st_mtime))
+                return f"{path.stem}  ·  PDF: {src}  ·  файл от {when}"
+
+            pick = st.selectbox("Макет", files, format_func=_layout_label)
             if st.button("📂 Открыть", type="primary"):
                 ss.layout = json.loads(pick.read_text(encoding="utf-8"))
                 ss.layout_path = str(pick)
@@ -447,6 +502,21 @@ if step == STEPS[0]:
         if isinstance(cov, (int, float)):
             st.caption(f"Текст сверен с текстовым слоем PDF на {cov * 100:.0f}% — "
                        "опечатки и подмены букв отслеживаются автоматически.")
+            unread = layout.get("unread_layer_words") or []
+            if cov < CFG["vision"].get("coverage_warning_threshold", 0.9) and unread:
+                with st.expander(f"⚠️ Не прочитано {len(unread)} слов текстового "
+                                 f"слоя (покрытие {cov * 100:.0f}%) — возможно, "
+                                 "пропущен или обрезан блок", expanded=False):
+                    st.caption("Найдите эти слова на макете: если они в одном "
+                               "месте — блок не прочитан целиком, распознайте "
+                               "заново или допишите текст блока вручную.")
+                    st.markdown(", ".join(unread))
+            if layout.get("text_layer_partial"):
+                share = layout.get("text_layer_invented_share") or 0
+                st.warning(f"Часть текста этого макета — в кривых (≈{share * 100:.0f}% "
+                           "прочитанных слов нет в текстовом слое). Для таких блоков "
+                           "автоматическая проверка «слов вне слоя» отключена — "
+                           "просмотрите их тексты внимательнее (R-23).")
         else:
             st.warning("В этом PDF нет текстового слоя (шрифты в кривых): "
                        "автоматическая сверка опечаток невозможна — "
@@ -526,6 +596,9 @@ if step == STEPS[0]:
             region = next(r for r in regions if r["id"] == sel)
             if region.get("status_reason"):
                 st.caption(f"{region.get('status')} — {region['status_reason']}")
+            elif region.get("layer_partial") and region.get("invented_words"):
+                st.caption("прочитано · блок частично в кривых, в текстовом слое "
+                           "нет слов: " + ", ".join(region["invented_words"][:8]))
             new_text = st.text_area(
                 "Исправьте ошибки распознавания",
                 value=region.get("text") or "", height=320, key=f"txt_{sel}")
@@ -561,6 +634,7 @@ if step == STEPS[0]:
                            ("Если он верный — подтвердите блок; " if unsure else
                             "Если правки не нужны — ") +
                            "к проверке — кнопкой внизу.")
+            layer_diff_table(region)
 
         # ── НИЖЕ: общий вид макета с подсветкой блоков ─────────────────────
         if pdf:
@@ -602,9 +676,14 @@ if step == STEPS[0]:
                 # перерисовке. Без памяти об обработанном клике старый клик
                 # переигрывал кнопки «предыдущий/следующий» и откатывал выбор
                 # на блок, по которому кликали раньше (R-03). Реагируем
-                # только на клик, которого ещё не видели.
-                click_sig = (clicked.get("x"), clicked.get("y"),
-                             clicked.get("width"), clicked.get("height"))
+                # только на клик, которого ещё не видели. Подпись клика —
+                # его время (unix_time компонента): подпись по координатам
+                # и размерам ломалась, когда после «Сохранить» страница
+                # перестраивалась и картинка меняла ширину на пиксели —
+                # старый клик выглядел новым (R-29).
+                click_sig = clicked.get("unix_time") or (
+                    round(clicked["x"] / (clicked.get("width") or 1), 4),
+                    round(clicked["y"] / (clicked.get("height") or 1), 4))
                 if click_sig != ss.get("last_click"):
                     ss.last_click = click_sig
                     # Компонент возвращает фактические размеры отображения —

@@ -328,6 +328,46 @@ def test_confirm_button_on_step1():
         S.connect = real_connect
 
 
+def test_step1_layer_diff_table_and_coverage_warning():
+    """R-12/R-15/R-24 в интерфейсе: у блока с подменой слова раскрыта
+    таблица сверки (подмена, непрочитанные слова слоя, слова вне слоя);
+    при низком покрытии слоя — список непрочитанных слов страницы; при
+    «смеси кривых» — предупреждение."""
+    at, _, real_connect = _app_with_tmp_db()
+    try:
+        at.run()
+        layout = json.loads(json.dumps(LAYOUT))
+        layout["regions"][0].update({
+            "has_layer": True, "layer_partial": False,
+            "word_substitutions": [{"layer": "молодой", "vision": "молотый",
+                                    "kind": "substitution"}],
+            "layer_missing_words": ["молодой", "варить"],
+            "invented_words": ["молотый", "Exporter"], "invented_digits": ["4820140240955"],
+            "status_reason": "ВОЗМОЖНАЯ ПОДМЕНА СЛОВА: на макете «молодой», прочитано «молотый»"})
+        layout["text_layer_coverage"] = 0.82
+        layout["unread_layer_words"] = ["молодой", "варить", "плите"]
+        layout["text_layer_partial"] = True
+        layout["text_layer_invented_share"] = 0.41
+        lp = Path(tempfile.mkdtemp()) / "m.json"
+        lp.write_text(json.dumps(layout, ensure_ascii=False), encoding="utf-8")
+        at.session_state["layout"] = layout
+        at.session_state["layout_path"] = str(lp)
+        at.run()
+        assert not at.exception, at.exception
+        page = " ".join(m.value for m in at.markdown)
+        assert "варить" in page and "Exporter, 4820140240955" in page, page[-600:]
+        assert "не прочитано (1)" in page                    # «молодой» ушёл в пару
+        assert "в текстовом слое PDF нет (2)" in page
+        assert any("молодой" in str(t.value) for t in at.table)   # таблица подмен
+        exp = [e.label for e in at.expander]
+        assert any("расхождений: 4" in e for e in exp), exp
+        assert any("Не прочитано 3 слов" in e for e in exp), exp
+        warns = " ".join(w.value for w in at.warning)
+        assert "в кривых" in warns and "41%" in warns
+    finally:
+        S.connect = real_connect
+
+
 def test_plan_keeps_every_other_remark():
     """R-06: прочие замечания (орфография) идут в план каждым пунктом, а не
     первыми двумя; 👎 по блоку убирает их из плана."""

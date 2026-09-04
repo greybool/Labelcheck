@@ -280,6 +280,41 @@ def test_layer_word_findings_homoglyph():
     assert not any("cmyk" in i or "230" in i for i in items), items
 
 
+def test_layer_word_findings_grouped():
+    """R-13/R-17: 45 непрочитанных слов одного блока — ОДНА строка с
+    примерами (при низком покрытии — «пропуск распознавания», отсылка к
+    шагу 1); подмены из регионов (R-15) — отдельно и первыми; гомоглифы —
+    отдельно; слова из пар в общий список не дублируются."""
+    words = [f"слово{i}" for i in range(45)]
+    layout = {"text_layer_coverage": 0.82,
+              "unread_layer_words": ["молодой", "hалейте"] + words,
+              "regions": [{"id": "t1r12", "word_substitutions": [
+                  {"layer": "молодой", "vision": "молотый", "kind": "substitution"}]}]}
+    items = V.layer_word_findings(layout, {"vision": {"coverage_warning_threshold": 0.9}})
+    assert len(items) == 3, items
+    assert items[0].startswith("возможная опечатка на макете") and "молодой" in items[0]
+    assert "гомоглиф" in items[1] and "hалейте" in items[1]
+    assert items[2].startswith("45 слов текстового слоя") and "82%" in items[2]
+    assert "пропуск распознавания" in items[2] and "слово0, слово1" in items[2]
+    # покрытие нормальное — та же строка, но без «пропуск распознавания»
+    ok = V.layer_word_findings({"text_layer_coverage": 0.97,
+                                "unread_layer_words": words[:3]})
+    assert len(ok) == 1 and "3 слов" in ok[0] and "пропуск распознавания" not in ok[0]
+    assert V.layer_word_findings({}) == []
+
+
+def test_ecode_alphabet_findings():
+    """R-20: латинская E в Е-кодах русского блока — находка кодом с правкой;
+    кириллические коды, английские блоки и слова вроде «E-mail» не трогаются."""
+    facts = [{"region": "r1", "lang": "ru", "text": "стабилизатор E1414, Е621, эмульгатор E322 (E1414)"},
+             {"region": "r2", "lang": "en", "text": "stabiliser E1414"},
+             {"region": "r3", "lang": "ru", "text": "E-mail: info@example.com, класс E10, ГОСТ 12345"}]
+    items = V.ecode_alphabet_findings(facts)
+    assert items == ["Е-код записан латинской буквой E вместо кириллической Е: "
+                     "E1414 → Е1414, E322 → Е322 (регион r1)"], items
+    assert "разнобой" not in V.SPELLING_PROMPT.lower() or "Не используй" in V.SPELLING_PROMPT
+
+
 def test_categories_override():
     """«Кнопки» категорий: override отключает автодетект (манду без категорий
     вообще, несмотря на курицу в составе)."""
@@ -386,6 +421,32 @@ def test_barcode_found_and_deduplicated():
     assert "a, b, c" in block["items"][0]
 
 
+def test_barcode_checked_against_text_layer():
+    """R-16: код, которого нет в слое, — «вероятная ошибка чтения» независимо
+    от контрольной цифры; код из слоя подтверждается; код слоя, не
+    прочитанный vision, — отдельная находка; без цифр в слое — оговорка."""
+    invented = {"regions": [{"id": "r", "kind": "marks", "text": "штрихкод: 4820140240955"}],
+                "layer_digit_runs": ["8805957025951"]}
+    items = V.barcode_check(invented)["items"]
+    assert any("4820140240955" in i and "такого кода НЕТ" in i for i in items), items
+    valid_but_absent = {"regions": [{"id": "r", "kind": "marks", "text": "4607070255215"}],
+                        "layer_digit_runs": ["8805957025951"]}
+    items = V.barcode_check(valid_but_absent)["items"]
+    assert V.ean13_checksum_ok("4607070255215")           # арифметика бы не поймала
+    assert "сходится" in items[0] and "такого кода НЕТ" in items[0], items
+    assert any("8805957025951" in i and "не распознан" in i for i in items), items
+    confirmed = {"regions": [{"id": "r", "kind": "marks", "text": "8 805957 025951"}],
+                 "layer_digit_runs": ["8805957025951"]}
+    items = V.barcode_check(confirmed)["items"]
+    assert len(items) == 1 and "подтверждён текстовым слоем" in items[0], items
+    no_layer = {"regions": [{"id": "r", "kind": "marks", "text": "4820140240955"}],
+                "layer_digit_runs": []}
+    items = V.barcode_check(no_layer)["items"]
+    assert len(items) == 1 and "сверить не с чем" in items[0], items
+    old_layout = {"regions": [{"id": "r", "kind": "marks", "text": "4820140240955"}]}
+    assert "слое" not in V.barcode_check(old_layout)["items"][0]   # поля нет — молчим
+
+
 def test_barcode_8_digits_only_with_caveat():
     """8 цифр без 13-значного кода — только с оговоркой (может быть датой),
     а при наличии EAN-13 восьмёрки вообще не показываются."""
@@ -419,12 +480,68 @@ def test_citation_non_dict_ignored_not_crashing():
 
 
 def test_spelling_item_format():
-    """Орфография: «что не так» и цитата — раздельные поля."""
-    client = FakeClient([{"remarks": [{"region": "r2", "quote": "мука,вода",
-                                       "what": "пропущен пробел после запятой"}]}])
+    """Орфография (R-28): «что не так: «как на макете» → правильно: «как
+    должно быть» — цитата (регион)»; старый ответ без wrong/correct — как
+    раньше. Одинаковые ответы трёх голосов дают одну находку."""
+    client = FakeClient([{"remarks": [
+        {"region": "r2", "quote": "мука,вода", "wrong": "мука,вода",
+         "correct": "мука, вода", "what": "пропущен пробел после запятой"}]}])
     block = V.spelling_check(V.collect_facts(LAYOUT), client, CFG, V.TokenTally())
     assert block["items"] == [
-        "пропущен пробел после запятой — «мука,вода» (регион r2)"]
+        "пропущен пробел после запятой: «мука,вода» → правильно: «мука, вода» "
+        "— «мука,вода» (регион r2)"], block["items"]
+    assert len(client.calls) == CFG["verdict"]["spelling_votes"] == 3
+    assert V.format_spelling_remark({"region": "r1", "quote": "q", "what": "старый формат"}) == \
+        "старый формат — «q» (регион r1)"
+
+
+def test_spelling_consensus_drops_unstable_remarks():
+    """R-25: находка попадает в отчёт, только если повторилась не меньше чем
+    в половине голосов; ключ — регион + дефектный фрагмент, поэтому разные
+    формулировки одного дефекта считаются одной находкой."""
+    stable = {"region": "r2", "quote": "мука,вода", "wrong": "мука,вода",
+              "correct": "мука, вода", "what": "нет пробела"}
+    same_other_words = {**stable, "what": "пропущен пробел после запятой"}
+    flaky = {"region": "r2", "quote": "соль .", "wrong": "соль .", "correct": "соль.",
+             "what": "пробел перед точкой"}
+    runs = [[stable, flaky], [same_other_words], [stable]]
+    got = V.consensus_remarks(runs)
+    assert got == [stable], got                      # flaky был в 1 из 3
+    assert V.consensus_remarks([[flaky]]) == [flaky]  # один голос — всё
+    assert V.consensus_remarks([[], [], []]) == []
+    # разные регионы — разные находки даже при одинаковом фрагменте
+    a, b = {**stable, "region": "r1"}, {**stable, "region": "r2"}
+    assert V.consensus_remarks([[a, b], [a, b]]) == [a, b]
+
+
+def test_spelling_filter_drops_foreign_and_trailing_punct():
+    """R-25 (проверка 04.09): английские/корейские находки и «пропущенная
+    точка в конце» отбрасываются кодом; русские дефекты остаются."""
+    keep = {"region": "t2r1", "quote": "Варено-мороженные", "wrong": "Варено-мороженные",
+            "correct": "Варено-мороженые", "what": "неверное написание слова"}
+    remarks = [
+        {"region": "L8", "quote": "Name :", "wrong": "Name :", "correct": "Name:", "what": "пробел"},
+        {"region": "L8", "quote": "cabb", "wrong": "cabb", "correct": "cabbage", "what": "обрезано"},
+        {"region": "L9", "quote": "조리예", "wrong": "조리예", "correct": "조미예", "what": "корейское"},
+        {"region": "t1r5", "quote": "Изготовлено и упаковано:", "wrong": "Изготовлено и упаковано:",
+         "correct": "Изготовлено и упаковано.", "what": "пропущена точка в конце"},
+        {"region": "t1r8", "quote": "Северные в панцире", "wrong": "Северные в панцире",
+         "correct": "Северные в панцире.", "what": "пропущена точка"},
+        keep,
+        {"region": "r1", "quote": "мука,вода", "what": "старый формат без полей"},
+    ]
+    got = V.filter_spelling_remarks(remarks)
+    assert got == [keep, remarks[-1]], got
+
+
+def test_barcode_digits_do_not_join_across_lines():
+    """R-38: «82\n\n8 805957 025951» — это 82 и штрихкод, а не число из 15
+    цифр; код находится и подтверждается слоем."""
+    layout = {"regions": [{"id": "t2r2", "kind": "dates_storage",
+                           "text": "срок 82\n\n8 805957 025951\nEAC"}],
+              "layer_digit_runs": ["8805957025951"]}
+    items = V.barcode_check(layout)["items"]
+    assert len(items) == 1 and "8805957025951" in items[0] and "подтверждён" in items[0], items
 
 
 # ── конвейер и отчёт ─────────────────────────────────────────────────────────
@@ -439,8 +556,9 @@ def test_check_layout_report_shape():
     assert [b["id"] for b in report["other_remarks"]] == [18, 19]
     assert set(report["meta"]["categories"]) == {"meat"}  # свинина в составе
     # 18 LLM-аспектов (17-й без LLM): 11 по одному вызову + 7 нестабильных
-    # по 3 голоса (день надёжности; 20 добавлен днём 9) + 1 CHEAP = 33
-    assert len(client.calls) == 33
+    # по 3 голоса (день надёжности; 20 добавлен днём 9) + 3 CHEAP-голоса
+    # орфографии (R-25) = 35
+    assert len(client.calls) == 35
     assert report["vision"]["manual_regions"][0]["id"] == "r4"
 
 

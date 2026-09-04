@@ -83,12 +83,17 @@ KIND_HINTS = {
 READ_PROMPT = """На изображении — фрагмент макета упаковки пищевой продукции.
 Перепиши ВЕСЬ текст фрагмента дословно, построчно, ничего не пропуская и не переводя.
 Сохраняй Е-коды, проценты, номера, адреса и регистр как напечатано.
-Опиши обнаруженные знаки/пиктограммы одной строкой каждую (например: «знак EAC»,
-«штрихкод: <цифры>»).
+Текст, идущий по дуге, кругу, вертикально или под углом, тоже переписывай.
+Знаки и пиктограммы, которые РЕАЛЬНО видны в кадре, опиши одной строкой каждую
+в виде «знак: <что изображено или какая надпись внутри>»; штрихкод — строкой
+«штрихкод: <цифры>». Не называй знаки по памяти или по образцу: если знака
+в кадре нет — строки о нём быть не должно. Цифры под штрихкодом переписывай
+только если они читаются целиком; иначе пиши «штрихкод: %s» — не додумывай
+цифры.
 Слова и строки, обрезанные КРАЕМ фрагмента, пропускай молча — не переписывай
 и не помечай: это край выреза, а не дефект макета.
 Пометку %s ставь только там, где текст целиком в кадре, но прочитать его нельзя.
-НЕ угадывай нечитаемое. Никаких комментариев — только содержимое фрагмента.""" % UNREADABLE_MARK
+НЕ угадывай нечитаемое. Никаких комментариев — только содержимое фрагмента.""" % (UNREADABLE_MARK, UNREADABLE_MARK)
 
 
 # ── вспомогательные ──────────────────────────────────────────────────────────
@@ -277,10 +282,19 @@ def text_layer_words(pdf_path, boxes_px, scale, min_len,
     на inset_px (паддинговая кайма кропа). Модель по промпту пропускает
     текст, обрезанный краем кропа, поэтому слова из каймы нельзя требовать
     с неё — каждый сосед в кайме давал ложное расхождение (тестовая лента, День 4).
+
+    Ядро считается от ОБЪЕДИНЕНИЯ кропов, а не от каждого куска: длинный
+    регион режется на половины с перехлёстом, и кайма каждой половины
+    выбрасывала целую полосу слов на стыке (гёдза, REVIEW-LOG R-15:
+    «молодой» лежал в зазоре между ядрами половин и в сверку не попадал —
+    подмена «молодой → молотый» была невидима). Перехлёст половин
+    гарантирует, что слово на стыке целиком есть хотя бы в одной из них.
     Возвращает None, если текстового слоя в зоне нет (макет в кривых).
     """
     import pdfplumber
 
+    if not boxes_px:
+        return None
     with pdfplumber.open(pdf_path) as pdf:
         page = pdf.pages[page_index]
         # dedupe_chars: надписи с обводкой лежат в PDF дважды поверх себя,
@@ -289,16 +303,23 @@ def text_layer_words(pdf_path, boxes_px, scale, min_len,
         words = page.dedupe_chars().extract_words()
         page.flush_cache()
         page.get_textmap.cache_clear()
+    return layer_words_in_core(words, boxes_px, scale, min_len, inset_px)
+
+
+def layer_words_in_core(words, boxes_px, scale, min_len, inset_px=(0, 0)):
+    """Чистая часть text_layer_words: слова pdfplumber (x0/top/x1/bottom в
+    пунктах) → множество слов, целиком лежащих в ядре объединения кропов."""
     ix, iy = inset_px
+    cx0 = min(b[0] for b in boxes_px) + ix
+    cy0 = min(b[1] for b in boxes_px) + iy
+    cx1 = max(b[2] for b in boxes_px) - ix
+    cy1 = max(b[3] for b in boxes_px) - iy
     found = set()
     for w in words:
         wx0, wy0, wx1, wy1 = (w["x0"] * scale, w["top"] * scale,
                               w["x1"] * scale, w["bottom"] * scale)
-        for (bx0, by0, bx1, by1) in boxes_px:
-            if (wx0 >= bx0 + ix and wy0 >= by0 + iy
-                    and wx1 <= bx1 - ix and wy1 <= by1 - iy):
-                found |= _words(w["text"], min_len)
-                break
+        if wx0 >= cx0 and wy0 >= cy0 and wx1 <= cx1 and wy1 <= cy1:
+            found |= _words(w["text"], min_len)
     return found if found else None
 
 
@@ -452,14 +473,103 @@ def invented_words(vision_text, page_words, min_len=4):
         for w in _INVENT_WORD.findall(text):
             known.add(norm(w))
     joined = norm("".join(t for t, _ in page_words))
-    checked = "\n".join(line for line in (vision_text or "").splitlines()
-                         if not _SIGN_LINE.match(line))
     out = []
-    for w in _INVENT_WORD.findall(checked):
-        ok_len = len(w) >= (2 if re.search(r"[가-힣]", w) else min_len)
-        if ok_len and norm(w) not in known and norm(w) not in joined:
+    for w in invent_candidates(vision_text, min_len):
+        if norm(w) not in known and norm(w) not in joined:
             out.append(w)
     return out
+
+
+def invent_candidates(vision_text, min_len=4):
+    """Слова vision-текста, которые сторож выдумок вообще проверяет (без
+    строк-описаний знаков, без коротких слов). Знаменатель для доли
+    «слов вне слоя» по региону и по странице (REVIEW-LOG R-23)."""
+    checked = "\n".join(line for line in (vision_text or "").splitlines()
+                         if not _SIGN_LINE.match(line))
+    return [w for w in _INVENT_WORD.findall(checked)
+            if len(w) >= (2 if re.search(r"[가-힣]", w) else min_len)]
+
+
+_DIGIT_RUN_SPACED = re.compile(r"\d(?:[\d ]*\d)?")
+
+
+def digit_runs(text, min_len=8):
+    """Длинные числа текста (пробелы внутри снимаются: «8 805957 025951» —
+    один код). Штрихкоды, партии, телефоны — то, что сторож букв не видит
+    (REVIEW-LOG R-16: выдуманный EAN в конце обрезанного блока)."""
+    out = []
+    for m in _DIGIT_RUN_SPACED.finditer(text or ""):
+        d = m.group().replace(" ", "")
+        if len(d) >= min_len:
+            out.append(d)
+    return out
+
+
+def layer_digit_runs(page_words, min_len=8):
+    """Длинные числа текстового слоя всей страницы — эталон для сверки
+    штрихкода. Слова слоя идут в порядке извлечения, поэтому разбитый
+    пробелами код склеивается. Пусто — цифр в слое нет (штрихкод картинкой),
+    сверка невозможна, это не ошибка."""
+    if not page_words:
+        return []
+    return digit_runs(" ".join(t for t, _ in page_words), min_len)
+
+
+def invented_digits(vision_text, layer_runs, min_len=8):
+    """Числа vision-текста, которых нет в числах слоя (только если в слое
+    вообще есть длинные числа — иначе сравнивать не с чем)."""
+    if not layer_runs:
+        return []
+    return [d for d in digit_runs(vision_text, min_len)
+            if not any(d in run for run in layer_runs)]
+
+
+# Латинские буквы, неотличимые на глаз от кириллических (гомоглифы):
+# «Hалейте» с латинской H — дефект макета, который vision молча «чинит».
+_HOMOGLYPHS = str.maketrans("abcehkmoptxyABCEHKMOPTXY", "авсенкмортхуАВСЕНКМОРТХУ")
+
+
+def levenshtein(a, b, limit=3):
+    """Редакционное расстояние с ранним выходом (> limit → limit + 1)."""
+    if abs(len(a) - len(b)) > limit:
+        return limit + 1
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        if min(cur) > limit:
+            return limit + 1
+        prev = cur
+    return prev[-1]
+
+
+def word_substitutions(missing_words, invented, cfg):
+    """Пары «слово слоя не прочитано ↔ слово vision не из слоя», похожие
+    друг на друга: vision прочитал НЕ то, что напечатано (REVIEW-LOG R-15:
+    «молодой» → «молотый» — модель молча исправила опечатку макета).
+    kind: homoglyph — те же буквы, но часть латиницей (дефект макета);
+    substitution — другое слово. Каждое слово vision участвует один раз,
+    берётся ближайшая пара."""
+    max_d = cfg.get("substitution_max_distance", 2)
+    min_len = cfg.get("substitution_min_len", 5)
+    free = [w for w in invented if len(w) >= min_len]
+    pairs = []
+    for m in missing_words:
+        if len(m) < min_len:
+            continue
+        best, best_d = None, max_d + 1
+        for v in free:
+            d = levenshtein(m.lower(), v.lower(), max_d)
+            if d < best_d:
+                best, best_d = v, d
+        if best is None or best_d > max_d:
+            continue
+        free.remove(best)
+        same = m.lower().translate(_HOMOGLYPHS) == best.lower().translate(_HOMOGLYPHS)
+        pairs.append({"layer": m, "vision": best,
+                      "kind": "homoglyph" if same else "substitution"})
+    return pairs
 
 
 def merge_regions(regions, gap):
@@ -539,6 +649,162 @@ def layer_fill_regions(regions, page_words, gap=0.015, min_words=3):
     return out
 
 
+def assess_region(text, read_status, bbox, boxes_px, full_img, pdf_path,
+                  page_words, cfg, layer_runs=None):
+    """Проход 3 для одного региона: сторожа чернил и текстового слоя.
+
+    Чистая функция от (текст, статус чтения, рамка, кропы, рендер, PDF):
+    её вызывает и живой прогон (analyze), и пересчёт статусов по готовому
+    layout'у без API (reguard_layout). Сторож ВЫДУМОК здесь только собирает
+    материал (список слов, счётчики) — решение о статусе принимает
+    finalize_layer_guards по всей странице сразу (REVIEW-LOG R-23).
+    """
+    status = read_status
+    if not text.strip():
+        reason = "регион пуст — рамка обзора могла сместиться"
+    elif status == STATUS_MANUAL:
+        reason = "нечитаемые места"
+    else:
+        reason = ""
+    # Сторож чернил: непустой текст при пустой рамке = текст пришёл из
+    # соседней зоны (повторное чтение расширяет рамку) — не факт макета.
+    if text.strip() and ink_ratio(full_img, bbox) < cfg.get("min_ink_ratio", 0.004):
+        status = STATUS_MANUAL
+        reason = ("в рамке нет чернил — текст мог прийти из соседней "
+                  "зоны при повторном чтении")
+    pad = cfg["pad_pct"] / 100.0
+    inset = (pad * full_img.size[0], pad * full_img.size[1])
+    layer = text_layer_words(pdf_path, boxes_px, cfg["render_scale"],
+                             cfg["min_word_len"], inset_px=inset)
+    mismatch, missing_words = check_against_text_layer(text, layer, cfg)
+    if mismatch is not None and mismatch > cfg["text_layer_mismatch_threshold"]:
+        status = STATUS_MANUAL
+        reason = (f"расхождение с текстовым слоем "
+                  f"{mismatch:.0%}: {', '.join(missing_words[:5])}")
+    fake, candidates, pairs = [], 0, []
+    if page_words and layer is not None:
+        fake = invented_words(text, page_words)
+        candidates = len(invent_candidates(text))
+        # Подмена слова — сигнал высшего приоритета: vision прочитал не то,
+        # что напечатано, и от кривых это не зависит (пара требует и слова
+        # слоя, и похожего слова vision).
+        pairs = word_substitutions(missing_words, fake, cfg)
+        if pairs:
+            status = STATUS_MANUAL
+            note = "ВОЗМОЖНАЯ ПОДМЕНА СЛОВА: " + "; ".join(
+                f"на макете «{p['layer']}», прочитано «{p['vision']}»"
+                + (" (латиница вместо кириллицы)" if p["kind"] == "homoglyph" else "")
+                for p in pairs[:4])
+            reason = (note + "; " + reason) if reason else note
+    digits = invented_digits(text, layer_runs or [])
+    return {"status": status, "status_reason": reason,
+            "text_layer_mismatch": mismatch,
+            "layer_missing_words": missing_words[:200],
+            "invented_words": fake[:100],
+            "invented_digits": digits,
+            "word_substitutions": pairs,
+            "invent_candidates": candidates,
+            "layer_words_in_box": len(layer) if layer else 0,
+            "vision_words": len(_words(text, cfg["min_word_len"])),
+            "has_layer": layer is not None}
+
+
+def page_invented_share(regions):
+    """Доля проверяемых vision-слов страницы, которых нет в текстовом слое
+    (по регионам, где слой есть). None — таких регионов нет."""
+    cand = sum(r.get("invent_candidates", 0) for r in regions if r.get("has_layer"))
+    if not cand:
+        return None
+    fake = sum(len(r.get("invented_words") or []) for r in regions if r.get("has_layer"))
+    return round(fake / cand, 3)
+
+
+def page_layer_partial(regions, cfg):
+    """Страница — «смесь кривых и живого текста»: слов вне слоя больше
+    порога. Пересчёт по layout'ам приёмки 02.09: креветки 0.41 (шесть ложных
+    «выдумок»), гёдза 0.11, манду 0.03 (там сторож ловил настоящие фабрикации).
+    """
+    share = page_invented_share(regions)
+    return share is not None and share >= cfg.get("layer_partial_page_share", 0.2)
+
+
+def region_layer_partial(region, cfg):
+    """Регион частично в кривых: слов слоя в рамке заметно меньше, чем слов
+    vision (логотип SEOUL на манду — 4 слова слоя на 15 прочитанных; блок
+    изготовителя креветок — 3 на 25). В таком регионе отсутствие слова в слое
+    ничего не значит."""
+    if not region.get("has_layer"):
+        return False
+    ratio = cfg.get("layer_partial_ratio", 0.5)
+    return region.get("layer_words_in_box", 0) < ratio * region.get("vision_words", 0)
+
+
+def finalize_layer_guards(regions, cfg, skip_ids=()):
+    """Сторож выдумок с учётом кривых (R-23). Регион уходит в ручную
+    проверку по словам вне слоя ТОЛЬКО если ни страница, ни регион не
+    частичны; иначе слова остаются в invented_words для таблицы
+    расхождений, а статус не трогается. skip_ids — регионы, статус которых
+    выставил человек (правка/подтверждение) — не пересматриваются."""
+    page_partial = page_layer_partial(regions, cfg)
+    for r in regions:
+        if not r.get("has_layer"):
+            r["layer_partial"] = False
+            continue
+        partial = page_partial or region_layer_partial(r, cfg)
+        r["layer_partial"] = partial
+        if r["id"] in skip_ids or partial:
+            continue
+        fake = r.get("invented_words") or []
+        share = len(fake) / max(1, r.get("invent_candidates", 0))
+        if (len(fake) >= cfg.get("invented_min_words", 2)
+                and share >= cfg.get("invented_share", 0.08)):
+            r["status"] = STATUS_MANUAL
+            note = ("слова вне текстового слоя (возможная выдумка): "
+                    + ", ".join(fake[:5]))
+            r["status_reason"] = (r["status_reason"] + "; " + note
+                                  if r.get("status_reason") else note)
+    return regions
+
+
+def reguard_layout(layout, pdf_path, cfg=None):
+    """Пересчёт сторожей по готовому layout'у БЕЗ API: тексты остаются, статусы
+    и поля сверки пересчитываются по PDF и рендеру. Регионы, которые человек
+    правил или подтверждал, не трогаются. Нужен, чтобы применить новые
+    правила сторожей (R-23) к уже распознанным макетам без перечитывания
+    ($0.10 и новый недетерминизм зрения на каждый макет)."""
+    cfg = cfg or render.load_config()
+    full_img = render.render_page(pdf_path, cfg["render_scale"])
+    page_words = layer_word_boxes(pdf_path)
+    layer_runs = layer_digit_runs(page_words)
+    human = {r["id"] for r in layout["regions"]
+             if r.get("human_edited") or r.get("human_confirmed")}
+    for r in layout["regions"]:
+        text = r.get("text") or ""
+        if not text.strip() and r.get("status_reason") == "битая рамка обзора":
+            continue
+        pieces = render.crop_region(full_img, r["bbox"], cfg)
+        boxes_px = [box for _, box in pieces]
+        read_status = (STATUS_MANUAL if UNREADABLE_MARK.lower() in text.lower()
+                       or not text.strip() else STATUS_OK)
+        fields = assess_region(text, read_status, r["bbox"], boxes_px,
+                               full_img, pdf_path, page_words, cfg, layer_runs)
+        if r["id"] in human:
+            # статус человека — истина; счётчики сверки всё равно нужны,
+            # иначе доля «слов вне слоя» по странице считалась бы без
+            # самого большого (правленого) блока и искажалась
+            fields.pop("status"), fields.pop("status_reason")
+        r.update(fields)
+    finalize_layer_guards(layout["regions"], cfg, skip_ids=human)
+    layout["text_layer_partial"] = page_layer_partial(layout["regions"], cfg)
+    layout["text_layer_invented_share"] = page_invented_share(layout["regions"])
+    layout["layer_digit_runs"] = layer_runs
+    all_text = "\n".join(r.get("text") or "" for r in layout["regions"])
+    coverage, unread = page_coverage(pdf_path, all_text, cfg)
+    layout["text_layer_coverage"] = coverage
+    layout["unread_layer_words"] = unread[:300]
+    return layout
+
+
 def analyze(pdf_path, cfg=None, out_path=None, quiet=False):
     """Полный vision-прогон макета: PDF → JSON макета."""
     load_dotenv()
@@ -572,6 +838,7 @@ def analyze(pdf_path, cfg=None, out_path=None, quiet=False):
             print(f"добавлено по слою: {len(extra)} регионов")
         regions += extra
 
+    layer_runs = layer_digit_runs(page_words)
     result_regions = []
     for region in regions:
         if region["kind"] == "technical":
@@ -591,48 +858,16 @@ def analyze(pdf_path, cfg=None, out_path=None, quiet=False):
             text, status, boxes_px = read_region(
                 client, read_model, full_img, wide, cfg, tally,
                 pad_override=cfg["retry_pad_pct"])
-        if not text.strip():
-            reason = "регион пуст — рамка обзора могла сместиться"
-        elif status == STATUS_MANUAL:
-            reason = "нечитаемые места"
-        else:
-            reason = ""
-        # Сторож чернил: непустой текст при пустой рамке = текст пришёл из
-        # соседней зоны (повторное чтение расширяет рамку) — не факт макета.
-        if text.strip() and ink_ratio(full_img, region["bbox"]) < \
-                cfg.get("min_ink_ratio", 0.004):
-            status = STATUS_MANUAL
-            reason = ("в рамке нет чернил — текст мог прийти из соседней "
-                      "зоны при повторном чтении")
-        pad = cfg["pad_pct"] / 100.0
-        inset = (pad * full_img.size[0], pad * full_img.size[1])
-        layer = text_layer_words(pdf_path, boxes_px, scale,
-                                 cfg["min_word_len"], inset_px=inset)
-        mismatch, missing_words = check_against_text_layer(text, layer, cfg)
-        if mismatch is not None and mismatch > cfg["text_layer_mismatch_threshold"]:
-            status = STATUS_MANUAL
-            reason = (f"расхождение с текстовым слоем "
-                      f"{mismatch:.0%}: {', '.join(missing_words[:8])}")
-        # Двусторонний сторож: слова vision, которых нет НИГДЕ в слое страницы
-        # (только для регионов, где слой есть) — кандидаты в выдумки.
-        fake = []
-        if page_words and layer is not None:
-            fake = invented_words(text, page_words)
-            share = len(fake) / max(1, len(text.split()))
-            if (len(fake) >= cfg.get("invented_min_words", 2)
-                    and share >= cfg.get("invented_share", 0.08)):
-                status = STATUS_MANUAL
-                reason = ((reason + "; ") if reason else "") + (
-                    "слова вне текстового слоя (возможная выдумка): "
-                    + ", ".join(fake[:8]))
-        result_regions.append({**_public(region), "text": text, "status": status,
-                               "status_reason": reason,
-                               "text_layer_mismatch": mismatch,
-                               "invented_words": fake[:12]})
-        if not quiet:
-            flag = "⚠" if status == STATUS_MANUAL else "✓"
-            print(f"  {flag} {region['id']:4s} {region['kind']:14s} "
-                  f"{region['lang']:5s} {len(text)} симв.")
+        result_regions.append({**_public(region), "text": text,
+                               **assess_region(text, status, region["bbox"],
+                                               boxes_px, full_img, pdf_path,
+                                               page_words, cfg, layer_runs)})
+    finalize_layer_guards(result_regions, cfg)
+    if not quiet:
+        for r in result_regions:
+            flag = "⚠" if r["status"] == STATUS_MANUAL else "✓"
+            print(f"  {flag} {r['id']:4s} {r['kind']:14s} {r['lang']:5s} "
+                  f"{len(r['text'])} симв.")
 
     missing = missing_kinds(result_regions, cfg)
 
@@ -655,7 +890,10 @@ def analyze(pdf_path, cfg=None, out_path=None, quiet=False):
         "regions": result_regions,
         "missing": missing,
         "text_layer_coverage": coverage,
-        "unread_layer_words": unread[:50],
+        "unread_layer_words": unread[:300],
+        "text_layer_partial": page_layer_partial(result_regions, cfg),
+        "text_layer_invented_share": page_invented_share(result_regions),
+        "layer_digit_runs": layer_runs,
     }
     if out_path:
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
@@ -672,10 +910,36 @@ def _public(region):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Vision-чтение PDF-макета упаковки")
-    ap.add_argument("pdf", help="путь к PDF-макету")
+    ap.add_argument("pdf", nargs="?", help="путь к PDF-макету")
     ap.add_argument("-o", "--out", default=None,
                     help="куда сохранить JSON (по умолчанию data/layouts/<имя>.json)")
+    ap.add_argument("--reguard", metavar="LAYOUT_JSON", default=None,
+                    help="не читать заново: пересчитать сторожа слоя по готовому "
+                         "layout'у (без API), результат — в тот же файл")
+    ap.add_argument("--reguard-all", action="store_true",
+                    help="пересчитать сторожа по ВСЕМ layout'ам data/layouts/ "
+                         "(кроме *.orig.json); PDF ищется по meta.source_pdf в "
+                         "data/samples_private и data/ui_uploads")
     args = ap.parse_args(argv)
+    if args.reguard_all:
+        return _reguard_all()
+    if not args.pdf:
+        ap.error("укажите PDF-макет (или --reguard-all)")
+    if args.reguard:
+        from labelcheck.store import save_layout
+        layout = json.loads(Path(args.reguard).read_text(encoding="utf-8"))
+        before = {r["id"]: r["status"] for r in layout["regions"]}
+        reguard_layout(layout, args.pdf)
+        save_layout(layout, args.reguard)
+        changed = [(rid, before[rid], r["status"]) for rid, r in
+                   ((r["id"], r) for r in layout["regions"]) if before[rid] != r["status"]]
+        manual = [r["id"] for r in layout["regions"] if r["status"] == STATUS_MANUAL]
+        print(f"страница частично в кривых: {layout['text_layer_partial']} "
+              f"(слов вне слоя: {layout['text_layer_invented_share']})")
+        print(f"ручная проверка: {len(manual)} {manual or ''}; изменили статус: "
+              + (", ".join(f"{rid} {a[:9]}→{b[:9]}" for rid, a, b in changed) or "—"))
+        print(f"JSON: {args.reguard}")
+        return 0
     out = args.out or Path("data/layouts") / (Path(args.pdf).stem + ".json")
     result = analyze(args.pdf, out_path=out)
     manual = [r["id"] for r in result["regions"] if r["status"] == STATUS_MANUAL]
@@ -687,6 +951,35 @@ def main(argv=None):
     for m, d in t.items():
         print(f"токены {m}: {d['prompt']}+{d['completion']} ({d['calls']} вызовов)")
     print(f"JSON: {out}")
+    return 0
+
+
+def _reguard_all(layouts_dir="data/layouts",
+                 pdf_dirs=("data/samples_private", "data/ui_uploads")):
+    """Пересчёт сторожей по всем layout'ам, у которых нашёлся исходный PDF
+    (R-40: у одного PDF бывает два layout'а — канонический и копия по имени
+    PDF; пересчёт по имени файла второй пропускал)."""
+    from labelcheck.store import save_layout
+    done = skipped = 0
+    for path in sorted(Path(layouts_dir).glob("*.json")):
+        if path.name.endswith(".orig.json"):
+            continue
+        layout = json.loads(path.read_text(encoding="utf-8"))
+        name = (layout.get("meta") or {}).get("source_pdf")
+        pdf = next((Path(d) / name for d in pdf_dirs if name and (Path(d) / name).exists()), None)
+        if pdf is None:
+            print(f"— {path.name}: PDF «{name}» не найден, пропуск")
+            skipped += 1
+            continue
+        before = {r["id"]: r["status"] for r in layout["regions"]}
+        reguard_layout(layout, str(pdf))
+        save_layout(layout, path)
+        changed = sum(1 for r in layout["regions"] if before[r["id"]] != r["status"])
+        manual = sum(1 for r in layout["regions"] if r["status"] == STATUS_MANUAL)
+        print(f"✓ {path.name}: ручная проверка {manual}, статус изменили {changed}, "
+              f"страница частично в кривых: {layout['text_layer_partial']}")
+        done += 1
+    print(f"пересчитано {done}, пропущено {skipped}")
     return 0
 
 

@@ -218,7 +218,7 @@ def _vision_table(vision: list[dict]) -> pd.DataFrame:
         "покрытие слоя": (f"{v['coverage']:.0%}" if v.get("coverage") is not None
                           else "нет текстового слоя"),
         "слов слоя не прочитано": v["unread_words"],
-        "блоков с «выдумками»": v["invented"],
+        "блоков со словами вне слоя": v["invented"],
         "не найдено обязательных блоков": v["missing"],
     } for v in vision])
 

@@ -74,9 +74,17 @@ SYSTEM_PROMPT = """Ты — проверяющий маркировку пище
 2. Если требование к данному продукту не применяется (например, аспект об
    импортёре, а признаков импорта нет) — applicable: false, status
    «соответствует», объясни почему не применяется.
-3. Неуверенность, нехватка данных, факт из ненадёжно прочитанного региона,
-   отсутствие подходящего пункта в списке — status «требует ручной проверки».
-   Додуманный вердикт хуже честного «не знаю»: галлюцинация дороже неполноты.
+3. Неуверенность, нехватка данных, отсутствие подходящего пункта в списке —
+   status «требует ручной проверки». Додуманный вердикт хуже честного «не
+   знаю»: галлюцинация дороже неполноты. Пометка региона «прочитан
+   ненадёжно» сама по себе НЕ основание для ручной проверки (решение
+   владельца): делай вывод по прочитанному тексту как есть. ТОЛЬКО если
+   среди использованных фактов есть регион с такой пометкой, добавь в
+   explanation отдельное предложение с ЕГО реальным id: «регион <id>
+   прочитан ненадёжно — вывод требует сверки с макетом»; если помеченных
+   регионов нет — ничего об этом не пиши. Ручная проверка уместна, только
+   если сам текст такого региона искажён (обрывки, [неразборчиво]) и вывод
+   по нему сделать нельзя.
    При статусе «требует ручной проверки» explanation обязан заканчиваться
    конкретным следующим действием: что именно проверить вручную или какой
    вопрос задать производителю/поставщику (например: «запросить вид куриного
@@ -87,10 +95,16 @@ SYSTEM_PROMPT = """Ты — проверяющий маркировку пище
    нарушение» объяснение обязано заканчиваться одним-двумя простыми
    предложениями: ЧТО именно на макете не так, КАК должно быть по
    процитированной норме и что исправить — читатель отчёта не обязан
-   реконструировать вывод из рассуждений.
+   реконструировать вывод из рассуждений. Не перечисляй проверки, по
+   которым замечаний нет, и не рассуждай о правилах, которые к продукту не
+   относятся (например, о виде сырья по птице у продукта без птицы): в
+   explanation — только то, что влияет на вывод.
 5. Тебе передан не весь регламент: ОТСУТСТВИЕ в списке пункта,
    подтверждающего разрешённость или требование, — не доказательство
-   нарушения. Не хватает нормы для вывода — «требует ручной проверки»."""
+   нарушения. Не хватает нормы для вывода — «требует ручной проверки».
+6. Слова из иноязычных блоков (корейский, английский и др.) упоминай только
+   с русским переводом в скобках и указанием региона: «물엿 (крахмальная
+   патока, регион t2r4)». Читатель отчёта не обязан знать эти языки."""
 
 
 # ── нормализация и извлечение ────────────────────────────────────────────────
@@ -289,7 +303,7 @@ def facts_block(facts: list[dict]) -> str:
         return "(регионов этого типа на макете не найдено)"
     lines = []
     for f in facts:
-        flag = "" if f["reliable"] else " [⚠ прочитан ненадёжно — требует ручной проверки]"
+        flag = "" if f["reliable"] else " [⚠ прочитан ненадёжно — сверить с макетом]"
         lines.append(f"— регион {f['region']} ({f['kind']}, язык {f['lang']}){flag}:\n{f['text']}")
     return "\n\n".join(lines)
 
@@ -744,7 +758,10 @@ def judge_aspect(aspect: dict, facts: list[dict], categories: set[str],
 
 # ── «прочие замечания»: аспекты 18–19 ────────────────────────────────────────
 
-_DIGIT_RUN = re.compile(r"\d[\d\s]{6,}\d")
+# Цифры с пробелами внутри строки: «4 601234 567890». Перенос строки НЕ
+# входит (REVIEW-LOG R-38: «82\n\n8 805957 025951» склеивалось в 15 цифр, и
+# прочитанный штрихкод считался ненайденным).
+_DIGIT_RUN = re.compile(r"\d[\d \u00a0\u2009]{6,}\d")
 
 
 def ean13_checksum_ok(digits: str) -> bool:
@@ -775,16 +792,40 @@ def barcode_check(layout: dict) -> dict:
                 near.setdefault(digits, []).append(region["id"])
             elif len(digits) == 8:
                 runs8.setdefault(digits, []).append(region["id"])
+    # Сверка со СЛОЕМ (REVIEW-LOG R-16): выдуманный код 4820140240955 на
+    # манду имел верную контрольную цифру — арифметика его не ловит, а слой
+    # знает только 8805957025951. Если в слое длинных чисел нет (штрихкод
+    # картинкой), сверка невозможна — говорим об этом честно.
+    layer_runs = layout.get("layer_digit_runs")   # None — старый layout без поля
+
+    def layer_note(d):
+        if layer_runs is None:
+            return ""
+        if not layer_runs:
+            return " (в текстовом слое PDF цифр штрихкода нет — сверить не с чем)"
+        if any(d in run for run in layer_runs):
+            return "; подтверждён текстовым слоем PDF"
+        return (" — в текстовом слое PDF такого кода НЕТ: вероятная ошибка "
+                "чтения (модель могла додумать цифры), требуется ручная проверка")
+
     items = []
     for d, regs in runs13.items():
         where = ", ".join(dict.fromkeys(regs))
         if ean13_checksum_ok(d):
             items.append(f"найден код {d} (регионы: {where}); "
-                         "контрольная цифра EAN-13 сходится")
+                         "контрольная цифра EAN-13 сходится" + layer_note(d))
         else:
             items.append(f"найден код {d} (регионы: {where}), но контрольная "
                          "цифра EAN-13 НЕ сходится — код неверно прочитан "
-                         "или битый, требуется ручная проверка")
+                         "или битый, требуется ручная проверка" + layer_note(d))
+    for d in layer_runs or []:
+        # код есть в слое, но ни в одном прочитанном тексте — vision его
+        # пропустил или прочитал с ошибкой
+        if len(d) == 13 and ean13_checksum_ok(d) and d not in runs13 \
+                and not any(d in other for other in list(runs13) + list(near)):
+            items.append(f"в текстовом слое PDF есть код {d} (контрольная цифра "
+                         "сходится), но в прочитанных текстах его нет — "
+                         "штрихкод не распознан или прочитан с ошибкой")
     for d, regs in near.items():
         where = ", ".join(dict.fromkeys(regs))
         items.append(f"число из {len(d)} цифр {d} (регионы: {where}) похоже "
@@ -804,30 +845,68 @@ def barcode_check(layout: dict) -> dict:
 
 
 SPELLING_PROMPT = """Ты — корректор русского текста упаковки пищевой продукции.
-Найди орфографические и пунктуационные дефекты: пропущенные/лишние пробелы,
-незакрытые скобки и кавычки, пропущенные точки, разнобой в написании терминов
-и Е-кодов. НЕ комментируй стиль, содержание, англоязычный текст и
-соответствие регламентам; переносы строк внутри регионов — артефакт чтения
-макета, не дефект. Верни JSON:
+Найди орфографические и пунктуационные дефекты: ошибки в словах (в том числе
+похожее по написанию, но не то слово — «молодой перец» вместо «молотый»,
+«мороженные» вместо «мороженые»), пропущенные/лишние пробелы, незакрытые
+скобки и кавычки, пропущенные точки, одно и то же слово или термин в РАЗНЫХ
+написаниях на одном макете.
+Для каждого дефекта заполни поля: wrong — дословно как на макете; correct —
+как должно быть (единственный правильный вариант); what — суть дефекта
+(3–10 слов). Для слова в двух написаниях в what перечисли обе формы
+дословно, в correct — норму. Не используй слова «разнобой»,
+«неконсистентно». Е-коды и алфавит их буквы не комментируй — это
+проверяется отдельно. Проверяй ТОЛЬКО русский текст: английские, корейские,
+китайские слова и строки не комментируй вообще. НЕ дефекты: отсутствие
+точки в конце заголовка, строки таблицы, подписи поля («Изготовлено и
+упаковано:») или отдельной надписи; переносы строк внутри регионов и слова,
+обрезанные краем блока (артефакты чтения макета). НЕ комментируй стиль,
+содержание и соответствие регламентам. Верни JSON:
 {"remarks": [{"region": "<id региона>",
               "quote": "<дословный фрагмент с дефектом>",
-              "what": "<в чём дефект, 3-10 слов>"}]}
+              "wrong": "<как на макете>", "correct": "<как должно быть>",
+              "what": "<суть дефекта, 3-10 слов>"}]}
 Если дефектов нет — {"remarks": []}."""
 
 
-def layer_word_findings(layout: dict) -> list[str]:
+def layer_word_findings(layout: dict, cfg: dict | None = None) -> list[str]:
     """Детерминированные находки из текстового СЛОЯ PDF — без LLM.
 
     unread_layer_words — слова слоя, не найденные в vision-тексте. Урок
     сверки Дня 6: vision молча нормализует дефекты («Hалейте» с латинской H
     прочитан как «Налейте», опечатка «plaease» — как «please»), и дефект
-    терялся. Слова с кириллско-латинским миксом — почти наверняка
-    гомоглифная опечатка макета; остальные буквенные слова — кандидаты."""
+    терялся. Группировка (REVIEW-LOG R-13/R-17): раньше каждое непрочитанное
+    слово шло отдельной строкой — 49 «неточностей» на гёдза были одним
+    непрочитанным разделом «Способ приготовления», замаскированным под
+    орфографию. Теперь:
+    (а) подмены слов при чтении (R-15, из регионов) — каждая отдельно, первыми:
+        слово слоя похоже на прочитанное, но не совпадает — на макете,
+        скорее всего, опечатка, которую vision «починил»;
+    (б) гомоглифы (кир/лат-микс) — каждый отдельно: это дефекты макета;
+    (в) остальные непрочитанные слова — ОДНОЙ строкой с примерами: это
+        пропуск чтения, а не N дефектов; при низком покрытии слоя — с
+        отсылкой к шагу 1."""
     import unicodedata
     findings = []
+    paired = set()
+    for r in layout.get("regions", []) or []:
+        for pair in r.get("word_substitutions") or []:
+            paired.add(pair["layer"].lower())
+            if pair["kind"] == "homoglyph":
+                findings.append(
+                    f"гомоглифная опечатка в макете: слово «{pair['layer']}» смешивает "
+                    f"кириллицу и латиницу (прочитано как «{pair['vision']}» — дефект "
+                    f"виден только в текстовом слое PDF; регион {r['id']})")
+            else:
+                findings.append(
+                    f"возможная опечатка на макете: в текстовом слое PDF «{pair['layer']}», "
+                    f"прочитано «{pair['vision']}» — vision мог молча исправить ошибку "
+                    f"макета, сверьте с макетом (регион {r['id']})")
+    rest = []
     for word in layout.get("unread_layer_words", []) or []:
         if not any(ch.isalpha() for ch in word) or len(word) < 4:
             continue  # числа и короткий шум (коды Pantone и т.п.)
+        if word.lower() in paired:
+            continue  # уже показано как подмена
         names = [unicodedata.name(ch, "") for ch in word]
         has_cyr = any("CYRILLIC" in n for n in names)
         has_lat = any("LATIN" in n for n in names)
@@ -839,40 +918,151 @@ def layer_word_findings(layout: dict) -> list[str]:
         elif word.lower() in ("cmyk", "pantone", "yellow", "magenta", "cyan"):
             continue  # техобвязка дизайнера
         else:
+            rest.append(word)
+    if rest:
+        cov = layout.get("text_layer_coverage")
+        threshold = (cfg or {}).get("vision", {}).get("coverage_warning_threshold", 0.9)
+        examples = ", ".join(rest[:8]) + (" …" if len(rest) > 8 else "")
+        if isinstance(cov, (int, float)) and cov < threshold:
             findings.append(
-                f"слово слоя «{word}» не найдено в прочитанном тексте — "
-                "возможная опечатка макета или пропуск чтения, проверь глазами")
+                f"{len(rest)} слов текстового слоя PDF не найдены в прочитанном тексте "
+                f"(покрытие слоя {cov:.0%}; например: {examples}) — вероятно, блок "
+                "не прочитан или обрезан: это пропуск распознавания, а не орфография; "
+                "проверьте и дочитайте блок на шаге 1")
+        else:
+            findings.append(
+                f"{len(rest)} слов текстового слоя PDF не найдены в прочитанном тексте "
+                f"(например: {examples}) — возможные опечатки макета или пропуск "
+                "чтения; полный список — на шаге 1 в сверке блока")
+    return findings
+
+
+_LATIN_ECODE = re.compile(r"(?<![A-Za-z])E(\d{3,4}[a-zA-Z]?)(?![A-Za-z0-9])")
+
+
+def ecode_alphabet_findings(facts: list[dict]) -> list[str]:
+    """Е-коды латинской «E» в русских блоках — кодом, без LLM (REVIEW-LOG
+    R-20: модель писала «разнобой в записи Е-кодов», не называя ни кода, ни
+    нормы). В русской маркировке индекс добавки пишется кириллической «Е»;
+    английские блоки не проверяются — там латиница уместна. Одна строка на
+    регион, коды перечислены с правкой: E1414 → Е1414."""
+    findings = []
+    for f in facts:
+        if f.get("lang") not in ("ru", "mixed"):
+            continue
+        codes = []
+        for m in _LATIN_ECODE.finditer(f.get("text") or ""):
+            code = "E" + m.group(1)
+            if code not in codes:
+                codes.append(code)
+        if codes:
+            fixes = ", ".join(f"{c} → Е{c[1:]}" for c in codes)
+            findings.append(f"Е-код записан латинской буквой E вместо кириллической Е: "
+                            f"{fixes} (регион {f['region']})")
     return findings
 
 
 def spelling_check(facts: list[dict], client, cfg: dict,
                    tally: TokenTally, layout: dict | None = None) -> dict:
     """Аспект 19: детерминированные находки из слоя + CHEAP-модель по
-    русским блокам макета."""
-    layer_items = layer_word_findings(layout or {})
+    русским блокам макета.
+
+    Голосование (REVIEW-LOG R-25): один вызов дешёвой модели давал на одном
+    и том же макете разные наборы находок от прогона к прогону (то точки,
+    то пробелы). Теперь `spelling_votes` вызовов, в отчёт идут только
+    находки, повторившиеся не меньше чем в половине ответов (ключ — регион +
+    дефектный фрагмент). Формат пункта (R-28): «что не так: «как на макете»
+    → правильно: «как должно быть»» — читателю не нужно угадывать, какой из
+    двух вариантов верный."""
+    layer_items = layer_word_findings(layout or {}, cfg) + ecode_alphabet_findings(facts)
     ru_facts = [f for f in facts if f["lang"] in ("ru", "mixed")]
     base = {"id": 19, "key": "spelling", "name": "Орфография и пунктуация RU"}
     if not ru_facts:
         return {**base, "items": layer_items or ["русских блоков в макете не найдено"]}
     model = os.environ[cfg["verdict"]["cheap_env"]]
-    resp = client.chat.completions.create(
-        model=model,
-        response_format={"type": "json_object"},
-        messages=[{"role": "system", "content": SPELLING_PROMPT},
-                  {"role": "user", "content": facts_block(ru_facts)}])
-    tally.add(model, resp.usage)
-    try:
-        remarks = json.loads(resp.choices[0].message.content).get("remarks", [])
-    except json.JSONDecodeError:
-        remarks = [{"region": "?", "quote": "", "what": "модель вернула не-JSON"}]
-    items = []
-    for r in remarks:
-        if not isinstance(r, dict):
-            continue
-        quote = f" — «{r['quote']}»" if r.get("quote") else ""
-        items.append(f"{r.get('what', '?')}{quote} (регион {r.get('region', '?')})")
+    votes = max(1, int(cfg["verdict"].get("spelling_votes", 3)))
+    runs = []
+    for _ in range(votes):
+        resp = client.chat.completions.create(
+            model=model,
+            response_format={"type": "json_object"},
+            messages=[{"role": "system", "content": SPELLING_PROMPT},
+                      {"role": "user", "content": facts_block(ru_facts)}])
+        tally.add(model, resp.usage)
+        try:
+            remarks = json.loads(resp.choices[0].message.content).get("remarks", [])
+        except json.JSONDecodeError:
+            remarks = [{"region": "?", "quote": "", "what": "модель вернула не-JSON"}]
+        runs.append([r for r in remarks if isinstance(r, dict)])
+    items = [format_spelling_remark(r)
+             for r in filter_spelling_remarks(consensus_remarks(runs))]
     items = layer_items + items
     return {**base, "items": items or ["дефектов не найдено"]}
+
+
+def _remark_key(r: dict) -> tuple:
+    frag = norm_text(str(r.get("wrong") or r.get("quote") or r.get("what") or ""))
+    return (str(r.get("region", "?")), frag)
+
+
+def consensus_remarks(runs: list[list[dict]]) -> list[dict]:
+    """Находки, встретившиеся не меньше чем в половине прогонов (при одном
+    прогоне — все). Порядок — как в первом прогоне, где находка появилась."""
+    need = (len(runs) + 1) // 2
+    seen: dict[tuple, dict] = {}
+    counts: dict[tuple, int] = {}
+    order: list[tuple] = []
+    for run in runs:
+        keys_in_run = set()
+        for r in run:
+            k = _remark_key(r)
+            if k in keys_in_run:
+                continue
+            keys_in_run.add(k)
+            counts[k] = counts.get(k, 0) + 1
+            if k not in seen:
+                seen[k] = r
+                order.append(k)
+    return [seen[k] for k in order if counts[k] >= need]
+
+
+_CYRILLIC = re.compile(r"[а-яё]", re.IGNORECASE)
+_TRAILING_PUNCT = ".:;,!…"
+
+
+def filter_spelling_remarks(remarks: list[dict]) -> list[dict]:
+    """Страховка кодом поверх промпта (REVIEW-LOG R-25, проверка 04.09):
+    модель, несмотря на запрет, стабильно (в 2 из 3 голосов) комментировала
+    английские и корейские строки («Name :», «cabb → cabbage», «조리예») и
+    «пропущенную точку» в заголовках и подписях полей («Изготовлено и
+    упаковано:» → «…упаковано.»). Оставляем только находки, где дефектный
+    фрагмент содержит кириллицу, и отбрасываем те, где правка сводится к
+    знаку в конце строки."""
+    out = []
+    for r in remarks:
+        frag = str(r.get("wrong") or r.get("quote") or "")
+        if not _CYRILLIC.search(frag):
+            continue
+        wrong = str(r.get("wrong") or "").strip()
+        correct = str(r.get("correct") or "").strip()
+        if wrong and correct and wrong.rstrip(_TRAILING_PUNCT) == correct.rstrip(_TRAILING_PUNCT):
+            continue
+        out.append(r)
+    return out
+
+
+def format_spelling_remark(r: dict) -> str:
+    """«что не так: «как на макете» → правильно: «как должно быть» — «цитата»
+    (регион)». Старый формат ответа (без wrong/correct) — как раньше."""
+    what = str(r.get("what", "?")).strip().rstrip(".")
+    region = r.get("region", "?")
+    quote = f" — «{r['quote']}»" if r.get("quote") else ""
+    wrong, correct = (r.get("wrong") or "").strip(), (r.get("correct") or "").strip()
+    if wrong and correct:
+        return f"{what}: «{wrong}» → правильно: «{correct}»{quote} (регион {region})"
+    if correct:
+        return f"{what} → правильно: «{correct}»{quote} (регион {region})"
+    return f"{what}{quote} (регион {region})"
 
 
 # ── конвейер на макет ────────────────────────────────────────────────────────

@@ -334,6 +334,199 @@ def test_invented_ignores_sign_lines_and_spaced_headers():
     PASSED.append("invented_filters")
 
 
+# ── R-23: сторож выдумок и текст в кривых ────────────────────────────────────
+
+GUARD_CFG = {**CFG, "invented_min_words": 2, "invented_share": 0.08,
+             "layer_partial_ratio": 0.5, "layer_partial_page_share": 0.2}
+
+
+def _reg(rid, fake, cand, layer_n, vis_n, has_layer=True, status=STATUS_OK):
+    return {"id": rid, "status": status, "status_reason": "",
+            "invented_words": fake, "invent_candidates": cand,
+            "layer_words_in_box": layer_n, "vision_words": vis_n,
+            "has_layer": has_layer}
+
+
+def test_full_layer_region_keeps_invented_guard():
+    """Регион целиком в слое, слова вне слоя есть → как раньше, ручная
+    проверка (сфабрикованный KR-состав, «Exporter» Дня 8 не теряются)."""
+    regs = [_reg("a", ["Exporter", "PENTHIOPIL"], 20, 18, 20),
+            _reg("b", [], 30, 30, 30)]
+    V.finalize_layer_guards(regs, GUARD_CFG)
+    assert regs[0]["status"] == STATUS_MANUAL and "выдумка" in regs[0]["status_reason"]
+    assert regs[0]["layer_partial"] is False
+    assert regs[1]["status"] == STATUS_OK and regs[1]["status_reason"] == ""
+    PASSED.append("guard_full_layer")
+
+
+def test_partial_region_skips_invented_guard():
+    """Регион частично в кривых (слов слоя < половины слов vision: логотип
+    SEOUL на манду) — слова вне слоя остаются в списке, статус не трогается."""
+    regs = [_reg("logo", ["SEOUL", "ORIGINAL", "서울"], 15, 2, 16),
+            _reg("body", [], 100, 95, 100)]
+    V.finalize_layer_guards(regs, GUARD_CFG)
+    assert regs[0]["status"] == STATUS_OK and regs[0]["layer_partial"] is True
+    assert regs[0]["invented_words"] == ["SEOUL", "ORIGINAL", "서울"]
+    assert V.page_layer_partial(regs, GUARD_CFG) is False   # 3/115 — страница обычная
+    PASSED.append("guard_partial_region")
+
+
+def test_mixed_pdf_disables_invented_guard_pagewide():
+    """PDF со смесью кривых и живого текста (креветки: 41% проверяемых слов
+    вне слоя) — сторож выдумок не меняет статус НИ У ОДНОГО региона, даже
+    у того, где слов слоя много (t1r2: 24 из 33)."""
+    regs = [_reg("t1r2", ["Состав", "Пищевая", "энергетическая", "ценность"], 31, 24, 33),
+            _reg("t1r7", ["уполномоченная"] * 16, 18, 2, 23),
+            _reg("t2r1", ["Северные"] * 8, 15, 4, 20),
+            _reg("mismatch", [], 6, 4, 9, status=STATUS_MANUAL)]
+    regs[3]["status_reason"] = "расхождение с текстовым слоем 25%: доля14"
+    assert V.page_invented_share(regs) == round(28 / 70, 3)
+    assert V.page_layer_partial(regs, GUARD_CFG) is True
+    V.finalize_layer_guards(regs, GUARD_CFG)
+    assert [r["status"] for r in regs] == [STATUS_OK, STATUS_OK, STATUS_OK, STATUS_MANUAL]
+    assert all(r["layer_partial"] for r in regs)
+    assert regs[3]["status_reason"].startswith("расхождение")   # сторож слоя жив
+    PASSED.append("guard_mixed_pdf")
+
+
+def test_guard_skips_human_regions_and_no_layer():
+    """Регион без слоя — не участвует; регион, подтверждённый человеком, —
+    не пересматривается, но в долю по странице входит."""
+    regs = [_reg("h", ["Fake", "Word"], 10, 10, 10),
+            _reg("n", ["Whatever"] * 5, 5, 0, 5, has_layer=False),
+            _reg("ok", [], 40, 40, 40)]
+    V.finalize_layer_guards(regs, GUARD_CFG, skip_ids={"h"})
+    assert regs[0]["status"] == STATUS_OK          # человек решил — не трогаем
+    assert regs[1]["layer_partial"] is False and regs[1]["status"] == STATUS_OK
+    assert V.page_invented_share(regs) == round(2 / 50, 3)
+    assert V.page_invented_share([regs[1]]) is None
+    PASSED.append("guard_skip")
+
+
+def test_invent_candidates_counts_checked_words_only():
+    text = "Состав: мука, соль\nзнак EAC\nштрихкод: 4820140240955\nВода 100 мл"
+    assert V.invent_candidates(text) == ["Состав", "мука", "соль", "Вода"]
+    PASSED.append("invent_candidates")
+
+
+def test_reguard_layout_recomputes_without_api():
+    """Пересчёт сторожей по готовому layout'у: тексты на месте, статусы
+    пересчитаны, правленый человеком регион сохранил статус, но вошёл в
+    счётчики страницы. Рендер и слой подменены (без PDF)."""
+    from PIL import Image
+    layout = {"regions": [
+        {"id": "r1", "kind": "composition", "lang": "ru", "note": "", "bbox": [0.1, 0.1, 0.5, 0.5],
+         "text": "Состав: мука, соль, вода", "status": STATUS_MANUAL,
+         "status_reason": "слова вне текстового слоя (возможная выдумка): мука"},
+        {"id": "r2", "kind": "other_text", "lang": "ru", "note": "", "bbox": [0.5, 0.5, 0.9, 0.9],
+         "text": "Правленый текст человека", "status": STATUS_OK,
+         "status_reason": "текст выверен человеком", "human_edited": True},
+    ]}
+    layout["regions"].append(
+        {"id": "r3", "kind": "composition", "lang": "ru", "note": "", "bbox": [0.1, 0.6, 0.5, 0.9],
+         "text": "перец черный молотый\nштрихкод: 4820140240955", "status": STATUS_OK,
+         "status_reason": ""})
+    page = [(w, (0.1, 0.1, 0.2, 0.2)) for w in
+            ("Состав", "мука", "соль", "вода", "перец", "черный", "молодой",
+             "8", "805957", "025951")]
+    layers = {(0.1, 0.1, 0.5, 0.5): {"состав", "мука", "соль", "вода"},
+              (0.5, 0.5, 0.9, 0.9): {"состав"},
+              (0.1, 0.6, 0.5, 0.9): {"перец", "черный", "молодой"}}
+    orig = (render.render_page, V.layer_word_boxes, V.text_layer_words, V.ink_ratio,
+            V.page_coverage, render.crop_region)
+    render.render_page = lambda pdf, scale: Image.new("RGB", (400, 400), "white")
+    render.crop_region = lambda img, bbox, cfg: [(None, tuple(bbox))]
+    V.layer_word_boxes = lambda pdf: page
+    V.text_layer_words = lambda pdf, boxes, *a, **k: layers[boxes[0]]
+    V.ink_ratio = lambda img, bbox: 0.5
+    V.page_coverage = lambda pdf, text, cfg: (1.0, [])
+    try:
+        out = V.reguard_layout(layout, "fake.pdf", GUARD_CFG)
+    finally:
+        (render.render_page, V.layer_word_boxes, V.text_layer_words, V.ink_ratio,
+         V.page_coverage, render.crop_region) = orig
+    r1, r2, r3 = out["regions"]
+    assert r3["status"] == STATUS_MANUAL and r3["status_reason"].startswith(
+        "ВОЗМОЖНАЯ ПОДМЕНА СЛОВА: на макете «молодой», прочитано «молотый»")
+    assert r3["word_substitutions"] == [{"layer": "молодой", "vision": "молотый",
+                                         "kind": "substitution"}]
+    assert r3["invented_digits"] == ["4820140240955"]      # в слое 8805957025951
+    assert out["layer_digit_runs"] == ["8805957025951"]
+    assert r1["status"] == STATUS_OK and r1["status_reason"] == ""   # всё в слое
+    assert r1["invented_words"] == [] and r1["text"] == "Состав: мука, соль, вода"
+    assert r2["status"] == STATUS_OK and r2["status_reason"] == "текст выверен человеком"
+    assert r2["invented_words"] == ["Правленый", "текст", "человека"]  # посчитано, статус цел
+    # доля по странице считается с правленым регионом: 3 его слова + «молотый»
+    # вне слоя из 10 проверяемых — 0.4 ≥ 0.2, страница «частично в кривых»
+    assert out["text_layer_partial"] is True and out["text_layer_invented_share"] == 0.4
+    assert out["text_layer_coverage"] == 1.0
+    PASSED.append("reguard")
+
+
+# ── R-15 / R-16: подмены слов, цифры, стык половин кропа ─────────────────────
+
+def test_layer_core_is_union_of_crop_pieces():
+    """Слово на стыке двух половин длинного кропа (в кайме каждой, но внутри
+    объединения) участвует в сверке; слово во внешней кайме — нет."""
+    def w(text, x0, x1, y0=10, y1=20):
+        return {"text": text, "x0": x0, "x1": x1, "top": y0, "bottom": y1}
+    pieces = [(0, 0, 1000, 100), (900, 0, 1900, 100)]     # перехлёст 900..1000
+    words = [w("стык", 940, 990), w("край", 5, 60), w("центр", 300, 400),
+             w("правый", 1500, 1600)]
+    got = V.layer_words_in_core(words, pieces, scale=1, min_len=3, inset_px=(100, 5))
+    assert got == {"стык", "центр", "правый"}, got
+    assert V.layer_words_in_core([], pieces, 1, 3) is None
+    PASSED.append("layer_core_union")
+
+
+def test_digit_runs_and_layer_confirmation():
+    """Числа ≥ 8 цифр (пробелы внутри снимаются); число vision, которого нет
+    в числах слоя, — «выдумка»; без чисел в слое сравнивать не с чем."""
+    assert V.digit_runs("EAN 8 805957 025951, тел. 123, партия 2026") == ["8805957025951"]
+    page = [(t, (0, 0, 0, 0)) for t in "штрихкод 8 805957 025951 масса 240".split()]
+    runs = V.layer_digit_runs(page)
+    assert runs == ["8805957025951"], runs
+    assert V.invented_digits("штрихкод: 4820140240955", runs) == ["4820140240955"]
+    assert V.invented_digits("штрихкод: 8805957025951", runs) == []
+    assert V.invented_digits("штрихкод: 4820140240955", []) == []   # слой без цифр
+    assert V.layer_digit_runs(None) == []
+    PASSED.append("digit_runs")
+
+
+def test_levenshtein_and_word_substitutions():
+    """«молодой» → «молотый» — подмена (расстояние 2: д→т, о→ы); «hалейте» →
+    «Налейте» — гомоглиф; короткие слова и далёкие пары («перец»/«перчик»,
+    расстояние 3) не считаются; каждое слово vision участвует один раз."""
+    assert V.levenshtein("молодой", "молотый") == 2
+    assert V.levenshtein("перец", "перчик") == 3
+    assert V.levenshtein("кот", "слон", 2) == 3          # ранний выход: > limit
+    cfg = {"substitution_max_distance": 2, "substitution_min_len": 5}
+    pairs = V.word_substitutions(
+        ["молодой", "hалейте", "соль", "перец", "варить"],
+        ["молотый", "Налейте", "сель", "перчик", "жарить"], cfg)
+    assert pairs == [{"layer": "молодой", "vision": "молотый", "kind": "substitution"},
+                     {"layer": "hалейте", "vision": "Налейте", "kind": "homoglyph"},
+                     {"layer": "варить", "vision": "жарить", "kind": "substitution"}], pairs
+    # «соль» короче 5 букв — не пара, хотя «сель» рядом
+    assert V.word_substitutions(["молодой", "молодая"], ["молотый"], cfg) == [
+        {"layer": "молодой", "vision": "молотый", "kind": "substitution"}]
+    assert V.word_substitutions([], ["молотый"], cfg) == []
+    PASSED.append("word_substitutions")
+
+
+def test_required_kinds_without_product_name():
+    """R-10: название не в required_kinds — у него нет сигнальных слов, и
+    проверка держалась на недетерминированной kind-метке."""
+    cfg = render.load_config(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "labelcheck", "config.yaml"))
+    assert "product_name" not in cfg["required_kinds"]
+    assert "composition" in cfg["required_kinds"]
+    regions = [{"kind": "other_text", "text": "Лепешка Roti. Состав: мука. Масса нетто 400 г. "
+                                              "Пищевая ценность. Годен до. Изготовитель"}]
+    assert V.missing_kinds(regions, cfg) == []
+    PASSED.append("required_kinds")
+
+
 if __name__ == "__main__":
     for name, fn in sorted((k, v) for k, v in globals().items()
                            if k.startswith("test_") and callable(v)):
