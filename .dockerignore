@@ -1,0 +1,35 @@
+# Никогда в образ: секреты и личные данные
+.env
+.env.*
+!.env.example
+data/samples_private/
+data/layouts/
+data/layouts_v2/
+data/layouts_v3/
+data/reports/
+data/ui_uploads/
+data/vision_gt/
+data/labelcheck.db
+data/verdict_cache.json
+data/actions_cache.json
+data/gt_embeddings.npz
+handoffs/
+_to_delete/
+
+# Кэш векторов приходит через том ./data (см. docker-compose.yml)
+data/embeddings.npz
+
+# Служебное
+.git/
+.venv/
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+.vscode/
+.idea/
+.agents/
+.claude/
+evaluation/runs/
+Dockerfile
+docker-compose.yml

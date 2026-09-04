@@ -42,6 +42,16 @@ def load_config(path: Path = CONFIG_PATH) -> dict:
     return yaml.safe_load(open(path, encoding="utf-8"))
 
 
+def qdrant_settings(cfg: dict) -> tuple[str, str]:
+    """(mode, url): из config.yaml, с переопределением переменными окружения
+    QDRANT_MODE и QDRANT_URL — так docker-compose переключает приложение на
+    сервер Qdrant, а локальный запуск без докера остаётся в памяти."""
+    import os
+    qcfg = cfg["qdrant"]
+    return (os.environ.get("QDRANT_MODE") or qcfg["mode"],
+            os.environ.get("QDRANT_URL") or qcfg["url"])
+
+
 def chunk_header(chunk: dict, fields: list[str]) -> str:
     """Шапка чанка из перечисленных в конфиге полей метаданных."""
     parts = []
@@ -138,16 +148,44 @@ class Retriever:
     # --- Векторный поиск ---
 
     def _ensure_qdrant(self):
-        """Ленивая инициализация: Qdrant собирается в памяти из npz-кэша
-        при первом векторном запросе (mode: memory) или подключается
-        к серверу (mode: server, docker-compose)."""
+        """Ленивая инициализация при первом векторном запросе.
+
+        mode: memory — Qdrant собирается в памяти из npz-кэша (~3 с).
+        mode: server — подключение к серверу (docker-compose, День 10); если
+        коллекции на сервере нет или в ней не тот набор точек, она
+        заливается из того же npz-кэша — источник истины векторов один,
+        отдельной базы на сервере не ведём. Режим и адрес можно переопределить
+        переменными окружения QDRANT_MODE / QDRANT_URL (compose ставит их,
+        не трогая config.yaml)."""
         if self._qdrant is not None:
             return
-        qcfg = self.cfg["qdrant"]
-        if qcfg["mode"] == "server":
-            self._qdrant = QdrantClient(url=qcfg["url"])
-            return
+        mode, url = qdrant_settings(self.cfg)
+        name = self.cfg["qdrant"]["collection"]
+        if mode == "server":
+            client = QdrantClient(url=url)
+            # Сервер в docker-compose поднимается параллельно с приложением:
+            # первые секунды соединение может не приниматься — ждём, а не
+            # падаем (до ~30 с).
+            import time
+            for attempt in range(10):
+                try:
+                    exists = client.collection_exists(name)
+                    break
+                except Exception:  # noqa: BLE001 — любая сетевая ошибка клиента
+                    if attempt == 9:
+                        raise
+                    time.sleep(3)
+            if exists and client.count(name, exact=True).count == len(self.chunk_ids):
+                self._qdrant = client
+                return
+        elif mode == "memory":
+            client = QdrantClient(":memory:")
+        else:
+            raise ValueError(f"qdrant.mode: ожидаю memory или server, получено {mode!r}")
+        self._fill_collection(client, name)
+        self._qdrant = client
 
+    def _load_vector_cache(self):
         cache = ROOT / self.cfg["embedding"]["cache"]
         if not cache.exists():
             raise FileNotFoundError(
@@ -157,22 +195,33 @@ class Retriever:
         if list(cached_ids) != self.chunk_ids:
             raise ValueError("кэш векторов не совпадает с корпусом по составу "
                              "чанков — пересоздай: python ingestion/index.py --force")
+        return data["vectors"]
 
-        client = QdrantClient(":memory:")
+    def _fill_collection(self, client, name: str):
+        """(Пере)создать коллекцию и залить векторы из npz-кэша."""
+        vectors = self._load_vector_cache()
+        if client.collection_exists(name):
+            client.delete_collection(name)
         client.create_collection(
-            collection_name=qcfg["collection"],
+            collection_name=name,
             vectors_config=qm.VectorParams(
                 size=self.cfg["embedding"]["dimensions"],
                 distance=qm.Distance.COSINE))
-        client.upsert(
-            collection_name=qcfg["collection"],
-            points=[qm.PointStruct(
-                id=i,
-                vector=data["vectors"][i].tolist(),
-                payload={"chunk_id": cid,
-                         "regulation_id": self.regulation_of[cid]})
-                for i, cid in enumerate(self.chunk_ids)])
-        self._qdrant = client
+        batch = 256  # серверу — порциями, а не 2417 точек одним запросом
+        for start in range(0, len(self.chunk_ids), batch):
+            client.upsert(
+                collection_name=name,
+                points=[qm.PointStruct(
+                    id=i,
+                    vector=vectors[i].tolist(),
+                    payload={"chunk_id": cid,
+                             "regulation_id": self.regulation_of[cid]})
+                    for i, cid in list(enumerate(self.chunk_ids))[start:start + batch]])
+
+    def warm_up_vectors(self):
+        """Собрать/залить коллекцию заранее (index.py в режиме server,
+        прогрев при старте контейнера)."""
+        self._ensure_qdrant()
 
     def embed_query(self, query: str) -> list[float]:
         if self.client is None:

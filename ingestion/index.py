@@ -25,7 +25,8 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 from evaluation.matcher import sha256_of  # та же пломба, что у ground truth
-from labelcheck.retrieval import CHUNKS_PATH, chunk_to_text, load_config
+from labelcheck.retrieval import (CHUNKS_PATH, Retriever, chunk_to_text,
+                                  load_config, qdrant_settings)
 
 
 def cache_is_fresh(cache: Path, corpus_sha: str, model: str) -> bool:
@@ -47,6 +48,10 @@ def main() -> int:
     if "--force" not in sys.argv and cache_is_fresh(cache, corpus_sha, ecfg["model"]):
         print(f"Кэш {cache.name} актуален (пломба корпуса совпадает) — "
               "эмбеддинги не пересчитываются. Пересоздать: --force")
+        mode, url = qdrant_settings(cfg)
+        if mode == "server":
+            Retriever(cfg).warm_up_vectors()
+            print(f"Коллекция на сервере Qdrant проверена/залита: {url}")
         return 0
 
     with open(CHUNKS_PATH, encoding="utf-8") as f:
@@ -82,21 +87,12 @@ def main() -> int:
     print(f"Готово: {matrix.shape[0]} векторов x{matrix.shape[1]} → {cache}")
     print(f"Фактический расход: {total_tokens:,} токенов ≈ ${cost:.3f}")
 
-    if cfg["qdrant"]["mode"] == "server":
-        from qdrant_client import QdrantClient
-        from qdrant_client import models as qm
-        qcfg = cfg["qdrant"]
-        qc = QdrantClient(url=qcfg["url"])
-        qc.recreate_collection(
-            collection_name=qcfg["collection"],
-            vectors_config=qm.VectorParams(size=matrix.shape[1],
-                                           distance=qm.Distance.COSINE))
-        qc.upsert(collection_name=qcfg["collection"],
-                  points=[qm.PointStruct(id=i, vector=matrix[i].tolist(),
-                                         payload={"chunk_id": c["chunk_id"],
-                                                  "regulation_id": c["regulation_id"]})
-                          for i, c in enumerate(chunks)])
-        print(f"Векторы залиты на сервер Qdrant: {qcfg['url']}")
+    mode, url = qdrant_settings(cfg)
+    if mode == "server":
+        # Заливка на сервер — тем же кодом, что и приложение (Retriever
+        # проверяет коллекцию и заливает из npz): один путь, не два.
+        Retriever(cfg).warm_up_vectors()
+        print(f"Векторы залиты на сервер Qdrant: {url}")
     return 0
 
 

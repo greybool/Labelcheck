@@ -94,6 +94,52 @@ def test_bm25_scores_descending():
     assert scores == sorted(scores, reverse=True)
 
 
+# --- Qdrant: режимы memory / server (docker-compose, День 10) ---
+
+def test_qdrant_settings_env_override():
+    """QDRANT_MODE / QDRANT_URL из окружения перекрывают config.yaml — так
+    compose переключает приложение на сервер, не трогая конфиг."""
+    import os
+    from labelcheck.retrieval import qdrant_settings
+    for k in ("QDRANT_MODE", "QDRANT_URL"):
+        os.environ.pop(k, None)
+    assert qdrant_settings(CFG) == (CFG["qdrant"]["mode"], CFG["qdrant"]["url"])
+    os.environ["QDRANT_MODE"], os.environ["QDRANT_URL"] = "server", "http://qdrant:6333"
+    try:
+        assert qdrant_settings(CFG) == ("server", "http://qdrant:6333")
+    finally:
+        del os.environ["QDRANT_MODE"], os.environ["QDRANT_URL"]
+
+
+def test_server_mode_fills_missing_collection_once():
+    """В режиме server пустой сервер получает коллекцию из npz-кэша, а
+    сервер с полной коллекцией не перезаливается. Сервер подменён
+    in-memory клиентом (без докера)."""
+    import os
+    from qdrant_client import QdrantClient
+    from labelcheck import retrieval as R
+    if not (ROOT / CFG["embedding"]["cache"]).exists():
+        return  # чистый клон без кэша векторов — проверять нечего
+    fake_server = QdrantClient(":memory:")
+    real = R.QdrantClient
+    R.QdrantClient = lambda *a, **k: fake_server
+    os.environ["QDRANT_MODE"] = "server"
+    try:
+        r = Retriever(CFG)
+        r._ensure_qdrant()
+        name = CFG["qdrant"]["collection"]
+        assert fake_server.count(name, exact=True).count == len(r.chunk_ids)
+        # второй Retriever видит полную коллекцию и не трогает её
+        fills = []
+        r2 = Retriever(CFG)
+        r2._fill_collection = lambda *a, **k: fills.append(1)
+        r2._ensure_qdrant()
+        assert fills == [] and r2._qdrant is fake_server
+    finally:
+        R.QdrantClient = real
+        del os.environ["QDRANT_MODE"]
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]
     failed = 0

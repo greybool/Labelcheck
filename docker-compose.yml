@@ -1,0 +1,39 @@
+# LabelCheck: два сервиса — Qdrant (векторный индекс) и приложение.
+#
+#   cp .env.example .env            # вписать OPENAI_API_KEY
+#   docker compose up --build       # http://localhost:8501
+#   docker compose run --rm app python ingestion/index.py
+#                                   # один раз: кэш векторов (~$0.03, 1 мин)
+#                                   # и заливка коллекции на сервер Qdrant
+#
+# Приложение переключается на сервер переменными QDRANT_MODE/QDRANT_URL —
+# labelcheck/config.yaml остаётся с mode: memory для запуска без докера.
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.19.0      # той же линии, что qdrant-client в requirements
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+  app:
+    build: .
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env                          # OPENAI_API_KEY, CHEAP/MAIN/VISION_MODEL
+    environment:
+      QDRANT_MODE: server
+      QDRANT_URL: http://qdrant:6333
+    volumes:
+      # Рабочие данные живут на хосте: журнал проверок (SQLite), layout'ы,
+      # загруженные PDF, кэш векторов — переживают пересборку образа.
+      - ./data:/app/data
+    depends_on:
+      - qdrant
+    restart: unless-stopped
+
+volumes:
+  qdrant_data:
