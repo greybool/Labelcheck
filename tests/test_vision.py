@@ -414,7 +414,7 @@ def test_reguard_layout_recomputes_without_api():
     пересчитаны, правленый человеком регион сохранил статус, но вошёл в
     счётчики страницы. Рендер и слой подменены (без PDF)."""
     from PIL import Image
-    layout = {"regions": [
+    layout = {"missing": ["product_name"], "regions": [
         {"id": "r1", "kind": "composition", "lang": "ru", "note": "", "bbox": [0.1, 0.1, 0.5, 0.5],
          "text": "Состав: мука, соль, вода", "status": STATUS_MANUAL,
          "status_reason": "слова вне текстового слоя (возможная выдумка): мука"},
@@ -460,6 +460,9 @@ def test_reguard_layout_recomputes_without_api():
     # вне слоя из 10 проверяемых — 0.4 ≥ 0.2, страница «частично в кривых»
     assert out["text_layer_partial"] is True and out["text_layer_invented_share"] == 0.4
     assert out["text_layer_coverage"] == 1.0
+    # missing[] пересчитан по конфигу (R-41): старое «product_name» ушло,
+    # а отсутствующие по сигнальным словам типы — на месте
+    assert "product_name" not in out["missing"] and "nutrition" in out["missing"]
     PASSED.append("reguard")
 
 

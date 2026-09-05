@@ -798,6 +798,11 @@ def reguard_layout(layout, pdf_path, cfg=None):
     layout["text_layer_partial"] = page_layer_partial(layout["regions"], cfg)
     layout["text_layer_invented_share"] = page_invented_share(layout["regions"])
     layout["layer_digit_runs"] = layer_runs
+    # missing[] тоже пересчитывается: список обязательных типов блоков задан
+    # конфигом (R-10 убрал product_name), а в старых layout'ах он застыл на
+    # момент распознавания — интерфейс показывал «не найден блок: название»
+    # и после правки конфига (найдено по скриншоту приёмки 04.09, R-41).
+    layout["missing"] = missing_kinds(layout["regions"], cfg)
     all_text = "\n".join(r.get("text") or "" for r in layout["regions"])
     coverage, unread = page_coverage(pdf_path, all_text, cfg)
     layout["text_layer_coverage"] = coverage
